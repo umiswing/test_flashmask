@@ -1,0 +1,159 @@
+from einops import repeat, rearrange
+import paddle
+from einops import rearrange, repeat
+
+def attention_ref(
+    q,
+    k,
+    v,
+    query_padding_mask=None,
+    key_padding_mask=None,
+    key_leftpad=None,
+    attn_bias=None,
+    dropout_p=0.0,
+    dropout_mask=None,
+    causal=False,
+    qv=None,
+    q_descale=None, k_descale=None, v_descale=None,
+    window_size=(-1, -1),  # -1 means infinite window size
+    attention_chunk=0,
+    sink_token_length=0,
+    softcap=0.0,
+    upcast=True,
+    reorder_ops=False,
+    intermediate_dtype=None,
+):
+    """
+    Arguments:
+        q: (batch_size, seqlen_q, nheads, head_dim)
+        k: (batch_size, seqlen_k, nheads, head_dim)
+        v: (batch_size, seqlen_k, nheads, head_dim_v)
+        qv: (batch_size, seqlen_q, nheads, head_dim_v)
+        query_padding_mask: (batch_size, seqlen_q)
+        key_padding_mask: (batch_size, seqlen_k)
+        attn_bias: broadcastable to (batch_size, nheads, seqlen_q, seqlen_k)
+        dropout_p: float
+        dropout_mask: (batch_size, nheads, seqlen_q, seqlen_k)
+        causal: whether to apply causal masking
+        upcast: whether to cast all inputs to fp32, do all computation in fp32, then cast
+            output back to fp16/bf16.
+        reorder_ops: whether to change the order of operations (scaling k instead of scaling k, etc.)
+            without changing the math. This is to estimate the numerical error from operation
+            reordering.
+    Output:
+        output: (batch_size, seqlen_q, nheads, head_dim_v)
+        attention: (batch_size, nheads, seqlen_q, seqlen_k), softmax after dropout
+    """
+    if causal:
+        window_size = (window_size[0], 0)
+    dtype_og = q.dtype
+    if upcast:
+        q = paddle.cast(q, paddle.float32)
+        k = paddle.cast(k, paddle.float32)
+        v = paddle.cast(v, paddle.float32)
+        qv = paddle.cast(qv, paddle.float32)
+
+    if q_descale is not None:
+        assert False
+        q_descale = repeat(q_descale, "b h -> b 1 (h g) 1", g=q.shape[2] // k.shape[2])
+        q = (q.cast(paddle.float32) * q_descale).cast(q.dtype)
+        qv = (qv.cast(paddle.float32) * q_descale).cast(qv.dtype) if qv is not None else None
+
+    if k_descale is not None:
+        assert False
+        k = (k.cast(paddle.float32) * rearrange(k_descale, "b h -> b 1 h 1")).cast(k.dtype)
+
+    if v_descale is not None:
+        assert False
+        v = (v.cast(paddle.float32) * rearrange(v_descale, "b h -> b 1 h 1")).cast(v.dtype)
+
+    # (batch_size, seqlen, nheads, head_dim) -> (batch_size, nheads, seqlen, head_dim)
+    q = paddle.transpose(q, [0, 2, 1, 3])
+    k = paddle.transpose(k, [0, 2, 1, 3])
+    v = paddle.transpose(v, [0, 2, 1, 3])
+
+    seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+    k = repeat(k, "b h s d -> b (h g) s d", g=q.shape[1] // k.shape[1])
+    v = repeat(v, "b h s d -> b (h g) s d", g=q.shape[1] // v.shape[1])
+    d = q.shape[-1]
+    dv = v.shape[-1]
+    softmax_scale = 1.0 / math.sqrt(d if qv is None else d + dv)
+
+    if not reorder_ops:
+        scores = paddle.matmul(q * softmax_scale, key, transpose_y=True)
+    else:
+        scores = paddle.matmul(q, key * softmax_scale, transpose_y=True)
+
+    if qv is not None:
+        assert False
+        scores = scores + paddle.matmul(qv * softmax_scale, v, transpose_y=True)
+
+    if softcap > 0:
+        assert False
+        scores = paddle.tanh(scores / softcap) * softcap
+
+    if key_padding_mask is not None:
+        assert False
+        scores.masked_fill_(rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf"))
+    local_mask = None
+
+    if window_size[0] >= 0 or window_size[1] >= 0:
+        assert False
+        local_mask = construct_local_mask(
+            seqlen_q,
+            seqlen_k,
+            window_size,
+            sink_token_length,
+            query_padding_mask,
+            key_padding_mask,
+            key_leftpad=key_leftpad,
+            device=q.device,
+        )
+    if attention_chunk > 0:
+        assert False
+        chunk_mask = construct_chunk_mask(
+            seqlen_q,
+            seqlen_k,
+            attention_chunk,
+            query_padding_mask,
+            key_padding_mask,
+            key_leftpad=key_leftpad,
+            device=q.device,
+        )
+        local_mask = paddle.logical_or(local_mask, chunk_mask) if local_mask is not None else chunk_mask
+
+    if local_mask is not None:
+        assert False
+        scores.masked_fill_(local_mask, float("-inf"))
+    if attn_bias is not None:
+        assert False
+        scores = scores + attn_bias
+    attention = paddle.nn.functional.softmax(scores, dim=-1).cast(v.dtype)
+    # We want to mask here so that the attention matrix doesn't have any NaNs
+    # Otherwise we'll get NaN in dV
+    if query_padding_mask is not None:
+        assert False
+        attention = attention.masked_fill(rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0)
+
+    # Without this we might get NaN in dv
+    if key_padding_mask is not None:
+        assert False
+        attention = attention.masked_fill(rearrange(~key_padding_mask, "b s -> b 1 1 s"), 0.0)
+    # Some rows might be completely masked out so we fill them with zero instead of NaN
+    if local_mask is not None:
+        assert False
+        attention = attention.masked_fill(paddle.all(local_mask, dim=-1, keepdim=True), 0.0)
+    dropout_scaling = 1.0 / (1 - dropout_p)
+    # attention_drop = attention.masked_fill(~dropout_mask, 0.0) * dropout_scaling
+    # output = paddle.matmul(attention_drop, v, transpose_y=True)
+    if dropout_mask is not None:
+        assert False
+        attention_drop = attention.masked_fill(~dropout_mask, 0.0)
+    else:
+        attention_drop = attention
+    if intermediate_dtype is not None:
+        attention_drop = attention_drop.cast(intermediate_dtype).cast(attention_drop.dtype)
+    output = paddle.matmul(attention_drop, v * dropout_scaling, transpose_y=True)
+    if query_padding_mask is not None:
+        output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+    return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
