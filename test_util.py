@@ -126,9 +126,20 @@ def attention_ref(
         assert False
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
-        assert False
         scores = scores + attn_bias
+        # when all values in a line of attn_bias are -inf, setting value in this line to a very small value
+        # to prevend softmax giving nan output
+        all_inf_mask = (attn_bias == -np.inf).all(axis=-1, keepdim=True)
+        scores = paddle.where(all_inf_mask, paddle.full_like(product, -1e9), scores)
+
     attention = paddle.nn.functional.softmax(scores, dim=-1).cast(v.dtype)
+
+    if attn_bias is not None:
+        # when all values in a line of attn_bias are -inf, we setting value in this line to a very small value
+        # to prevend softmax giving nan output, however, after softmax, values in this line become 1/seqlen,
+        # so setting them to 0 after softmax
+        attention = paddle.where(all_inf_mask, paddle.zeros_like(attention), attention)
+
     # We want to mask here so that the attention matrix doesn't have any NaNs
     # Otherwise we'll get NaN in dV
     if query_padding_mask is not None:
@@ -156,4 +167,4 @@ def attention_ref(
     output = paddle.matmul(attention_drop, v * dropout_scaling, transpose_y=True)
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
-    return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
+    return output.cast(dtype=dtype_og), attention.cast(dtype=dtype_og)
