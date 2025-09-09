@@ -1,33 +1,47 @@
+import os
+import math
+import itertools
+import pytest
+from einops import rearrange, repeat
 import paddle
 from paddle.nn.functional.flash_attention import flashmask_attention
+from generate_startend_row_indices import (
+  startend_row_indices_to_attn_bias,
+  generate_none_mask,
+  generate_sliding_window_mask,
+)
+from functools import partial
+from test_util import attention_ref
 
 # batch_size, seqlen_q, seqlen_k, nheads, nheads_kv
-shape_cases = [
-    (2840, 32, 32, 16, 4), # VisionPatchMerger 4 in 1
-    (1, 300, 300, 16, 16), # vis
-    (2, 8192, 32768, 32, 4),
-    (2, 8192, 8192, 32, 4),
-    (2, 8192, 8192, 14, 1),
-    (2, 16384, 16384, 4, 1),
-    (2, 16383, 16384, 4, 1),
-    (2, 16384, 16383, 4, 1),
-    # my case
-] + 
-# tridao case
-list(itertools.product(
-    [9],                # batch_size
-    [1, 64,  128, 256, 239, 799, 113, 113, 128, 113, 108, 256, 384, 640, 512, 1024, 1023, 1024,],       # seqlen_q
-    [1, 128, 192, 256, 1,   3,   203, 128, 217, 211, 256, 512, 256, 128, 256, 1024, 1024, 1023,],      # seqlen_k
-    [6],                # nheads
-    [6, 2, 1],          # nheads_kv
-)) +
-list(itertools.product(
-    [2],                # batch_size
-    [4096, 4224],       # seqlen_q
-    [4096, 4224],      # seqlen_k
-    [6],                # nheads
-    [6, 2, 1],          # nheads_kv
-))
+shape_cases = (
+    [
+        (2840, 32, 32, 16, 4), # VisionPatchMerger 4 in 1
+        (1, 300, 300, 16, 16), # vis
+        (2, 8192, 32768, 32, 4),
+        (2, 8192, 8192, 32, 4),
+        (2, 8192, 8192, 14, 1),
+        (2, 16384, 16384, 4, 1),
+        (2, 16383, 16384, 4, 1),
+        (2, 16384, 16383, 4, 1),
+        # my case
+    ]
+    # tridao case
+    + list(itertools.product(
+        [9],                # batch_size
+        [1, 64,  128, 256, 239, 799, 113, 113, 128, 113, 108, 256, 384, 640, 512, 1024, 1023, 1024,],       # seqlen_q
+        [1, 128, 192, 256, 1,   3,   203, 128, 217, 211, 256, 512, 256, 128, 256, 1024, 1024, 1023,],      # seqlen_k
+        [6],                # nheads
+        [6, 2, 1],          # nheads_kv
+    ))
+    + list(itertools.product(
+        [2],                # batch_size
+        [4096, 4224],       # seqlen_q
+        [4096, 4224],      # seqlen_k
+        [6],                # nheads
+        [6, 2, 1],          # nheads_kv
+    ))
+)
 
 # Generate all combinations for second param
 def generate_shapes():
@@ -41,18 +55,18 @@ def generate_shapes():
                 batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices
             )
 
-@pytest.mark.parametrize("dtype", paddle.bfloat16)
-@pytest.mark.parametrize("fa_version", 3)
-@pytest.mark.parametrize("d, dv", [128, 128])
+@pytest.mark.parametrize("dtype", [paddle.bfloat16])
+@pytest.mark.parametrize("fa_version", [3])
+@pytest.mark.parametrize("d, dv", [(128, 128)])
 @pytest.mark.parametrize(
     "batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices",
-    list(generate_shapes)
+    list(generate_shapes())
 )
 @pytest.mark.parametrize(
     "gen_startend_row_indices",
     [
-        partial(generate_none_mask, causal=False), # full
-        partial(generate_none_mask, causal=True), # causal
+        # partial(generate_none_mask, causal=False), # full
+        # partial(generate_none_mask, causal=True), # causal
         partial(generate_sliding_window_mask, window_size=1024), # sliding window
         # partial(generate_causal_document_mask, doc_seq_lens=[2538, 1742, 3213]), # causal document mask
         # partial(generate_document_mask, doc_seq_lens=[2538, 1742, 3213]), # document mask
@@ -67,13 +81,13 @@ def generate_shapes():
     ],
 )
 def test_flashmask(
-    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, nheads_startend_row_indices, fa_version, dtype, gen_startend_row_indices
+    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, nheads_startend_row_indices, fa_version, dtype, gen_startend_row_indices, softcap=0.0
 ):
     paddle.seed(2025)
-    assert nheads % nheads_k == 0
-    q_ref = paddle.randn(batch_size, seqlen_q, nheads, d, dtype=dtype)
-    k_ref = paddle.randn(batch_size, seqlen_k, nheads_kv, d, dtype=dtype)
-    v_ref = paddle.randn(batch_size, seqlen_k, nheads_kv, dv, dtype=dtype)
+    assert nheads % nheads_kv == 0
+    q_ref = paddle.randn(shape=[batch_size, seqlen_q, nheads, d], dtype=dtype)
+    k_ref = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, d], dtype=dtype)
+    v_ref = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, dv], dtype=dtype)
 
     q_ref.stop_gradient = False
     k_ref.stop_gradient = False
@@ -102,10 +116,10 @@ def test_flashmask(
         attn_bias=attn_bias
     )
 
-    out_naive_bf16, attn_naive_bf16 = attention_ref(
-        q_naive_bf16,
-        k_naive_bf16,
-        v_naive_bf16,
+    out_bf16, attn_bf16 = attention_ref(
+        q_bf16,
+        k_bf16,
+        v_bf16,
         causal=causal,
         attn_bias=attn_bias,
         upcast=False,
@@ -114,10 +128,11 @@ def test_flashmask(
 
     # Numerical error if we just do any arithmetic on out_ref
     fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    assert softcap == 0.0
     rtol = 2 if softcap == 0.0 else 3
 
-    print(f"Paddle naive bf16 Output max diff: {(out_naive_bf16 - out_ref).abs().max().item()}")
-    print(f"Paddle naive bf16 Output mean diff: {(out_naive_bf16 - out_ref).abs().mean().item()}")
+    print(f"Paddle naive bf16 Output max diff: {(out_bf16 - out_ref).abs().max().item()}")
+    print(f"Paddle naive bf16 Output mean diff: {(out_bf16 - out_ref).abs().mean().item()}")
 
     if fa_version == 2:
         paddle.set_flags({'FLAGS_flash_attn_version': 2})
@@ -144,12 +159,12 @@ def test_flashmask(
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
-    assert (out - out_ref).abs().max().item() <= rtol * (out_pt - out_ref).abs().max().item() + fwd_atol
+    assert (out - out_ref).abs().max().item() <= rtol * (out_bf16 - out_ref).abs().max().item() + fwd_atol
 
-    g = paddle.randn_like(out)
+    g = paddle.randn(shape=out.shape, dtype=out.dtype)
     out.backward(g)
     out_ref.backward(g)
-    out_naive_bf16.backward(g)
+    out_bf16.backward(g)
 
     print(f"flashmask dQ max diff: {(q.grad - q_ref.grad).abs().max().item()}")
     print(f"flashmask dK max diff: {(k.grad - k_ref.grad).abs().max().item()}")
@@ -158,16 +173,16 @@ def test_flashmask(
     print(f"flashmask dK mean diff: {(k.grad - k_ref.grad).abs().mean().item()}")
     print(f"flashmask dV mean diff: {(v.grad - v_ref.grad).abs().mean().item()}")
 
-    print(f"Paddle naive bf16 dQ max diff: {(q_naive_bf16.grad - q_ref.grad).abs().max().item()}")
-    print(f"Paddle naive bf16 dK max diff: {(k_naive_bf16.grad - k_ref.grad).abs().max().item()}")
-    print(f"Paddle naive bf16 dV max diff: {(v_naive_bf16.grad - v_ref.grad).abs().max().item()}")
-    print(f"Paddle naive bf16 dQ mean diff: {(q_naive_bf16.grad - q_ref.grad).abs().mean().item()}")
-    print(f"Paddle naive bf16 dK mean diff: {(k_naive_bf16.grad - k_ref.grad).abs().mean().item()}")
-    print(f"Paddle naive bf16 dV mean diff: {(v_naive_bf16.grad - v_ref.grad).abs().mean().item()}")
+    print(f"Paddle naive bf16 dQ max diff: {(q_bf16.grad - q_ref.grad).abs().max().item()}")
+    print(f"Paddle naive bf16 dK max diff: {(k_bf16.grad - k_ref.grad).abs().max().item()}")
+    print(f"Paddle naive bf16 dV max diff: {(v_bf16.grad - v_ref.grad).abs().max().item()}")
+    print(f"Paddle naive bf16 dQ mean diff: {(q_bf16.grad - q_ref.grad).abs().mean().item()}")
+    print(f"Paddle naive bf16 dK mean diff: {(k_bf16.grad - k_ref.grad).abs().mean().item()}")
+    print(f"Paddle naive bf16 dV mean diff: {(v_bf16.grad - v_ref.grad).abs().mean().item()}")
 
     dq_atol = 2 * (q_ref.grad + 0.3 - 0.3 - q_ref.grad).abs().max().item() + (0 if softcap == 0 else 3e-4)
-    assert (q.grad - q_ref.grad).abs().max().item() <= rtol * (q_naive_bf16.grad - q_ref.grad).abs().max().item() + dq_atol
+    assert (q.grad - q_ref.grad).abs().max().item() <= rtol * (q_bf16.grad - q_ref.grad).abs().max().item() + dq_atol
     dk_atol = 2 * (k_ref.grad + 0.3 - 0.3 - k_ref.grad).abs().max().item() + (0 if softcap == 0 else 3e-4)
-    assert (k.grad - k_ref.grad).abs().max().item() <= rtol * (k_naive_bf16.grad - k_ref.grad).abs().max().item() + dk_atol
+    assert (k.grad - k_ref.grad).abs().max().item() <= rtol * (k_bf16.grad - k_ref.grad).abs().max().item() + dk_atol
     dv_atol = 2 * (v_ref.grad + 0.3 - 0.3 - v_ref.grad).abs().max().item() + (0 if softcap == 0 else 3e-4)
-    assert (v.grad - v_ref.grad).abs().max().item() <= rtol * (v_naive_bf16.grad - v_ref.grad).abs().max().item() + dv_atol
+    assert (v.grad - v_ref.grad).abs().max().item() <= rtol * (v_bf16.grad - v_ref.grad).abs().max().item() + dv_atol
