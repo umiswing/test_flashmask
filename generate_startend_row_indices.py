@@ -1,15 +1,15 @@
 import paddle
 import numpy as np
 
-def startend_row_indices_to_attn_bias(startend_row_indices, dtype, causal=True):
+def startend_row_indices_to_attn_bias(startend_row_indices, seqlen_q, dtype, causal=True):
     if startend_row_indices is None:
         return None
-    bz, num_head, seq_len, bound_num = startend_row_indices.shape
-    m = paddle.zeros((bz, num_head, seq_len, seq_len), dtype=dtype)
+    bz, num_head, seqlen_k, bound_num = startend_row_indices.shape
+    m = paddle.zeros((bz, num_head, seqlen_q, seqlen_k), dtype=dtype)
     has_end = (causal and bound_num == 2) or ((not causal) and bound_num == 4)
     for bi in range(bz):
         for hi in range(num_head):
-            for j in range(seq_len):
+            for j in range(seqlen_k):
                 downstart = startend_row_indices[bi, hi, j, 0]
                 if has_end:
                     downend = startend_row_indices[bi, hi, j, 1]
@@ -17,7 +17,11 @@ def startend_row_indices_to_attn_bias(startend_row_indices, dtype, causal=True):
                 else:
                     m[bi, hi, downstart:, j] = -np.inf
                 if causal:
-                    m[bi, hi, :j, j] = -np.inf
+                    # from flash-attention 2.1 and in flash-attention 3, If seqlen_q != seqlen_k and causal=True,
+                    # the causal mask is aligned to the bottom right corner of the attention matrix,
+                    # instead of the top-left corner.
+                    # See: https://github.com/Dao-AILab/flash-attention?tab=readme-ov-file#21-change-behavior-of-causal-flag
+                    m[bi, hi, :max(0, j - (seqlen_k - seqlen_q)), j] = -np.inf
                 else:
                     if has_end:
                         upstart = startend_row_indices[bi, hi, j, 2]
@@ -170,7 +174,7 @@ def generate_causal_blockwise_mask(B, S, H, doc_seq_lens=[2538, 1742, 3213]):
     causal = True
     return startend_row_indices, causal
 
-def generate_prefix_lm_document_mask(B, S, H, doc_seq_lens=[(1024, 2538), (1742, 1742), (512, 3213)]):
+def generate_prefix_lm_document_mask(batch_size, seqlen_q, seqlen_k, h, doc_seq_lens=[(1024, 2538), (1742, 1742), (512, 3213)]):
     """
     tuple(prefix_length, seq_length)
     """
@@ -178,8 +182,8 @@ def generate_prefix_lm_document_mask(B, S, H, doc_seq_lens=[(1024, 2538), (1742,
     total_seq_len = 0
     for prefix_length, seq_length in doc_seq_lens:
         total_seq_len += seq_length
-    assert total_seq_len <= S
-    padding = S - total_seq_len
+    assert total_seq_len <= seqlen_k
+    padding = seqlen_k - total_seq_len
 
     down_left_row_indices = []
     cur_len_so_far = doc_seq_lens[0][1]
@@ -189,7 +193,7 @@ def generate_prefix_lm_document_mask(B, S, H, doc_seq_lens=[(1024, 2538), (1742,
             cur_len_so_far += doc_seq_lens[i+1][1]
     if padding > 0:
         down_left_row_indices.extend([cur_len_so_far] * padding)
-    down_left_row_indices = paddle.to_tensor(down_left_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
+    down_left_row_indices = paddle.to_tensor(down_left_row_indices, dtype=paddle.int32).reshape((1, 1, seqlen_k, 1)).repeat_interleave(batch_size, 0)
 
     up_right_row_indices = []
     cur_len_so_far = 0
@@ -198,9 +202,11 @@ def generate_prefix_lm_document_mask(B, S, H, doc_seq_lens=[(1024, 2538), (1742,
         cur_len_so_far += seq_length
     if padding > 0:
         up_right_row_indices.extend([total_seq_len] * padding)
-    up_right_row_indices = paddle.to_tensor(up_right_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
+    up_right_row_indices = paddle.to_tensor(up_right_row_indices, dtype=paddle.int32).reshape((1, 1, seqlen_k, 1)).repeat_interleave(batch_size, 0)
 
     startend_row_indices = paddle.concat([down_left_row_indices, up_right_row_indices], axis=-1)
+
+    startend_row_indices = paddle.clip(startend_row_indices, max=seqlen_q)
 
     causal = False
     return startend_row_indices, causal
