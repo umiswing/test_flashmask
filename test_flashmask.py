@@ -9,6 +9,7 @@ from generate_startend_row_indices import (
   startend_row_indices_to_attn_bias,
   generate_none_mask,
   generate_sliding_window_mask,
+  generate_prefix_lm_document_mask,
 )
 from functools import partial
 from test_util import attention_ref
@@ -18,15 +19,17 @@ shape_cases = (
     [
         (2840, 32, 32, 16, 4), # VisionPatchMerger 4 in 1
         (1, 300, 300, 16, 16), # vis
-        (2, 8192, 32768, 32, 4),
-        (2, 8192, 8192, 32, 4),
+        # (2, 8192, 32768, 32, 4), # this will oom
+        # (2, 8192, 8192, 32, 4), # this will oom
         (2, 8192, 8192, 14, 1),
         (2, 16384, 16384, 4, 1),
+        (1, 128, 127, 1, 1),
+        (1, 127, 128, 1, 1),
         (2, 16383, 16384, 4, 1),
         (2, 16384, 16383, 4, 1),
         # my case
     ]
-    # tridao case
+    # # tridao case
     + list(itertools.product(
         [9],                # batch_size
         [1, 64,  128, 256, 239, 799, 113, 113, 128, 113, 108, 256, 384, 640, 512, 1024, 1023, 1024,],       # seqlen_q
@@ -65,8 +68,8 @@ def generate_shapes():
 @pytest.mark.parametrize(
     "gen_startend_row_indices",
     [
-        # partial(generate_none_mask, causal=False), # full
-        # partial(generate_none_mask, causal=True), # causal
+        partial(generate_none_mask, causal=False), # full
+        partial(generate_none_mask, causal=True), # causal
         partial(generate_sliding_window_mask, window_size=1024), # sliding window
         # partial(generate_causal_document_mask, doc_seq_lens=[2538, 1742, 3213]), # causal document mask
         # partial(generate_document_mask, doc_seq_lens=[2538, 1742, 3213]), # document mask
@@ -75,6 +78,7 @@ def generate_shapes():
         # partial(generate_causal_blockwise_mask, doc_seq_lens=[2538, 1742, 3213]), # causal blockwise mask
         # partial(generate_causal_blockwise_mask, doc_seq_lens=[2538, 1742, 3912]), # causal blockwise mask
         # partial(generate_prefix_lm_document_mask, doc_seq_lens=[(1024, 2538), (1742, 1742), (512, 3213)]), # prefix lm document mask
+        ## partial(generate_prefix_lm_document_mask, doc_seq_lens=[(2538, 2538), (1742, 1742), (3911, 3911)]), # prefix lm document mask
         # partial(generate_prefix_lm_causal_mask, prefix_length=1024), # prefix lm causal mask
         # partial(generate_qk_sparse_mask, maskout_pair=[(1024, 538), (2358, 1700)]), # qk-sparse mask
         # partial(generate_random_eviction_mask, start_row=4096), # random eviction mask
@@ -83,7 +87,7 @@ def generate_shapes():
 def test_flashmask(
     batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, nheads_startend_row_indices, fa_version, dtype, gen_startend_row_indices, softcap=0.0
 ):
-    paddle.seed(2025)
+    paddle.seed(2024)
     assert nheads % nheads_kv == 0
     q_ref = paddle.randn(shape=[batch_size, seqlen_q, nheads, d], dtype=dtype)
     k_ref = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, d], dtype=dtype)
@@ -106,7 +110,7 @@ def test_flashmask(
     v.stop_gradient = False
 
     startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
-    attn_bias = startend_row_indices_to_attn_bias(startend_row_indices, dtype, causal)
+    attn_bias = startend_row_indices_to_attn_bias(startend_row_indices, seqlen_q, dtype, causal)
 
     out_ref, attn_ref = attention_ref(
         q_ref,
@@ -126,7 +130,7 @@ def test_flashmask(
         reorder_ops=True
     )
 
-    # Numerical error if we just do any arithmetic on out_ref
+    # # Numerical error if we just do any arithmetic on out_ref
     fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
     assert softcap == 0.0
     rtol = 2 if softcap == 0.0 else 3
@@ -159,6 +163,15 @@ def test_flashmask(
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
+
+    assert_mask =  ~((out - out_ref).abs() <= rtol * (out_bf16 - out_ref).abs() + fwd_atol)
+    indices = paddle.nonzero(assert_mask)
+
+    with open("wsm.log", "w") as file:
+        for idx in indices:
+            idx_tuple = tuple(idx.numpy().tolist())
+            file.write(f"Index: {idx_tuple}, out: {out[idx_tuple].item()}, out_ref: {out_ref[idx_tuple].item()}, ...\n")
+
     assert (out - out_ref).abs().max().item() <= rtol * (out_bf16 - out_ref).abs().max().item() + fwd_atol
 
     g = paddle.randn(shape=out.shape, dtype=out.dtype)

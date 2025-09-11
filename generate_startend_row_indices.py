@@ -46,10 +46,10 @@ def generate_sliding_window_mask(batch_size, seqlen_q, seqlen_k, h, window_size=
     causal=True
     return startend_row_indices, causal
 
-def generate_causal_document_mask(B, S, H, doc_seq_lens=[2538, 1742, 3213]):
-    total_seq_len = np.sum(doc_seq_lens)
-    assert total_seq_len <= S
-    assert len(doc_seq_lens) >= 3
+def generate_causal_document_mask(batch_size, seqlen_q, seqlen_k, h, doc_seqlens=[2538, 1742, 3213]):
+    total_seq_len = np.sum(doc_seqlens)
+    assert total_seqlen <= seqlen_k
+    assert len(doc_seqlens) >= 3
     padding = S - np.sum(doc_seq_lens)
     doc_seq_lens[-1] += padding
     seq_cusums = np.cumsum(doc_seq_lens)
