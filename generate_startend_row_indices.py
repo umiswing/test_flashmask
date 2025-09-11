@@ -166,7 +166,7 @@ def generate_global_sliding_window_mask(batch_size, seqlen_q, seqlen_k, h, globa
     down_left_start_row_indices[:global_token] = seqlen_q
     down_left_start_row_indices =  down_left_start_row_indices.reshape((1, 1, seqlen_k, 1)).repeat_interleave(batch_size, 0)
 
-    down_left_end_row_indices = paddle.full([seqlen_k], seqlen_k, dtype="int32").reshape((1, 1, seqlen_k, 1)).repeat_interleave(batch_size, 0)
+    down_left_end_row_indices = paddle.full([seqlen_k], seqlen_q, dtype="int32").reshape((1, 1, seqlen_k, 1)).repeat_interleave(batch_size, 0)
 
     up_right_start_row_indices = paddle.full([seqlen_k], global_token, dtype="int32")
     up_right_start_row_indices[:global_token+right_window_size+1] = 0
