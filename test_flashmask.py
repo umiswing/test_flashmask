@@ -9,7 +9,15 @@ from generate_startend_row_indices import (
   startend_row_indices_to_attn_bias,
   generate_none_mask,
   generate_sliding_window_mask,
+  generate_causal_document_mask,
+  generate_document_mask,
+  generate_share_question_mask,
+  generate_global_sliding_window_mask,
+  generate_causal_blockwise_mask,
   generate_prefix_lm_document_mask,
+  generate_prefix_lm_causal_mask,
+  generate_qk_sparse_mask,
+  generate_random_eviction_mask
 )
 from functools import partial
 from test_util import attention_ref
@@ -29,7 +37,7 @@ shape_cases = (
         (2, 16384, 16383, 4, 1),
         # my case
     ]
-    # # tridao case
+    # tridao case
     + list(itertools.product(
         [9],                # batch_size
         [1, 64,  128, 256, 239, 799, 113, 113, 128, 113, 108, 256, 384, 640, 512, 1024, 1023, 1024,],       # seqlen_q
@@ -49,10 +57,7 @@ shape_cases = (
 # Generate all combinations for second param
 def generate_shapes():
     for batch_size, seqlen_q, seqlen_k, nheads, nheads_kv in shape_cases:
-        if 2 < nheads and nheads % 2 == 0:
-            nheads_startend_row_indices_values = [1, 2, nheads]
-        else:
-            nheads_startend_row_indices_values = [1, nheads]
+        nheads_startend_row_indices_values = [1, nheads_kv]
         for nheads_startend_row_indices in nheads_startend_row_indices_values:
             yield (
                 batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices
@@ -70,18 +75,16 @@ def generate_shapes():
     [
         partial(generate_none_mask, causal=False), # full
         partial(generate_none_mask, causal=True), # causal
-        partial(generate_sliding_window_mask, window_size=1024), # sliding window
-        # partial(generate_causal_document_mask, doc_seq_lens=[2538, 1742, 3213]), # causal document mask
-        # partial(generate_document_mask, doc_seq_lens=[2538, 1742, 3213]), # document mask
-        # partial(generate_share_question_mask, doc_seq_lens=[2538, 1742, 3213]), # share question mask
-        # partial(generate_global_sliding_window_mask, global_token=16, window_size=(512, 512), # global sliding window
-        # partial(generate_causal_blockwise_mask, doc_seq_lens=[2538, 1742, 3213]), # causal blockwise mask
-        # partial(generate_causal_blockwise_mask, doc_seq_lens=[2538, 1742, 3912]), # causal blockwise mask
-        # partial(generate_prefix_lm_document_mask, doc_seq_lens=[(1024, 2538), (1742, 1742), (512, 3213)]), # prefix lm document mask
-        ## partial(generate_prefix_lm_document_mask, doc_seq_lens=[(2538, 2538), (1742, 1742), (3911, 3911)]), # prefix lm document mask
-        # partial(generate_prefix_lm_causal_mask, prefix_length=1024), # prefix lm causal mask
-        # partial(generate_qk_sparse_mask, maskout_pair=[(1024, 538), (2358, 1700)]), # qk-sparse mask
-        # partial(generate_random_eviction_mask, start_row=4096), # random eviction mask
+        partial(generate_sliding_window_mask), # sliding window
+        partial(generate_causal_document_mask), # causal document mask
+        partial(generate_document_mask), # document mask
+        partial(generate_share_question_mask), # share question mask
+        partial(generate_global_sliding_window_mask), # global sliding window
+        partial(generate_causal_blockwise_mask), # causal blockwise mask
+        partial(generate_prefix_lm_document_mask), # prefix lm document mask
+        partial(generate_prefix_lm_causal_mask), # prefix lm causal mask
+        partial(generate_qk_sparse_mask), # qk-sparse mask
+        partial(generate_random_eviction_mask), # random eviction mask
     ],
 )
 def test_flashmask(
@@ -110,7 +113,7 @@ def test_flashmask(
     v.stop_gradient = False
 
     startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
-    attn_bias = startend_row_indices_to_attn_bias(startend_row_indices, seqlen_q, dtype, causal)
+    attn_bias = startend_row_indices_to_attn_bias(startend_row_indices, seqlen_q, nheads, dtype, causal)
 
     out_ref, attn_ref = attention_ref(
         q_ref,
@@ -163,14 +166,6 @@ def test_flashmask(
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
-
-    assert_mask =  ~((out - out_ref).abs() <= rtol * (out_bf16 - out_ref).abs() + fwd_atol)
-    indices = paddle.nonzero(assert_mask)
-
-    with open("wsm.log", "w") as file:
-        for idx in indices:
-            idx_tuple = tuple(idx.numpy().tolist())
-            file.write(f"Index: {idx_tuple}, out: {out[idx_tuple].item()}, out_ref: {out_ref[idx_tuple].item()}, ...\n")
 
     assert (out - out_ref).abs().max().item() <= rtol * (out_bf16 - out_ref).abs().max().item() + fwd_atol
 
