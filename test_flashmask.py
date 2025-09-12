@@ -25,8 +25,8 @@ from test_util import attention_ref
 # batch_size, seqlen_q, seqlen_k, nheads, nheads_kv
 shape_cases = (
     [
-        (2840, 32, 32, 16, 4), # VisionPatchMerger 4 in 1
-        (1, 300, 300, 16, 16), # vis
+        (2840, 32, 32, 16, 4),
+        (1, 300, 300, 16, 16),
         # (2, 8192, 32768, 32, 4), # this will oom
         # (2, 8192, 8192, 32, 4), # this will oom
         (2, 8192, 8192, 14, 1),
