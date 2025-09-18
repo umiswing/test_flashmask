@@ -564,7 +564,7 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1):
                 doc_seq_lens_list.append((total_length, doc_list, qksparse_mask))
             
         #doc_seq_lens_list = doc_seq_lens_list[::-1]
-        for D in [128, 64]:
+        for D in [128]:
             H = 4096 // D
             for idx, (S, prefix_doc_seq_lens, qksparse_mask) in enumerate(doc_seq_lens_list):
                 B = 128 * 1024 // S
@@ -635,7 +635,7 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1):
                 )
                 content2=tabulate(results, headers=headers, tablefmt="tsv")
                 os.makedirs(f"{dtype}", exist_ok=True)
-                text_file = open(f"{dtype}/flashmaskv1_{B}_{S}_{H}_{D}_{idx}.csv","w")
+                text_file = open(f"{dtype}/flashmaskv{fm_version}_{B}_{S}_{H}_{D}_{idx}.csv","w")
                 text_file.write(content2)
                 text_file.close()
 

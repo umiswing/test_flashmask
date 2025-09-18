@@ -41,9 +41,9 @@ def plot_bar(categories, save_path, baseline_key):
 
         labels = data['labels']
         baseline = data[baseline_key]
-        flashmaskv2 = data['flashmaskv2']
+        flashmaskv3 = data['flashmaskv3']
         x = np.arange(len(labels))
-        increments = [(fm - fa) / fa * 100 for fa, fm in zip(baseline, flashmaskv2)]
+        increments = [(fm - fa) / fa * 100 for fa, fm in zip(baseline, flashmaskv3)]
 
         # FlexAttention
         if baseline_key == 'flashmaskv1':
@@ -63,8 +63,8 @@ def plot_bar(categories, save_path, baseline_key):
 
         # FlashMask 增量
         ax.barh(
-            # x, [flashmaskv2[j]-baseline[j] for j in range(len(labels))],
-            x, [max(0, flashmaskv2[j]-baseline[j]) for j in range(len(labels))],
+            # x, [flashmaskv3[j]-baseline[j] for j in range(len(labels))],
+            x, [max(0, flashmaskv3[j]-baseline[j]) for j in range(len(labels))],
             bar_height, left=baseline, label='FlashMask V3', color=colors[1]
         )
 
@@ -73,8 +73,8 @@ def plot_bar(categories, save_path, baseline_key):
             increment = increments[j]
             sign = '+' if increment >= 0 else ''
             ax.text(
-                max(baseline[j] + max(baseline)*0.005, flashmaskv2[j] + max(flashmaskv2)*0.005), x[j],
-                f'{flashmaskv2[j]:.1f} ({sign}{increment:.1f}%)',
+                max(baseline[j] + max(baseline)*0.005, flashmaskv3[j] + max(flashmaskv3)*0.005), x[j],
+                f'{flashmaskv3[j]:.1f} ({sign}{increment:.1f}%)',
                 va='center', ha='left', fontsize=12, color='black',
                 fontproperties=font_prop
             )
@@ -118,7 +118,7 @@ def main(baseline: str = "flashmaskv1"):
                 # for seqlen in [8192, 32768, 131072]:
                 for seqlen in [8192, 32768]:
                     method_to_df = {}
-                    for method in [baseline, 'flashmaskv2']:
+                    for method in [baseline, 'flashmaskv3']:
                         filenames = glob.glob(f'{root_dir}/{dtype}/{method}_*{seqlen}_*_{headdim}*.csv')
                         print(filenames)
                         dataframes = []
@@ -146,12 +146,12 @@ def main(baseline: str = "flashmaskv1"):
                         print('='*20)
                         print(mean_df)
                     one_item = {}
-                    labels = method_to_df['flashmaskv2']['Operation              '].tolist()
+                    labels = method_to_df['flashmaskv3']['Operation              '].tolist()
                     labels = [label.strip() for label in labels]
                     one_item['labels'] = labels
                     one_item[baseline] = method_to_df[baseline][metric].tolist()
-                    one_item['flashmaskv2 improvement'] = (method_to_df['flashmaskv2'][metric] - method_to_df[baseline][metric]).tolist()
-                    one_item['flashmaskv2'] = method_to_df['flashmaskv2'][metric].tolist()
+                    one_item['flashmaskv3 improvement'] = (method_to_df['flashmaskv3'][metric] - method_to_df[baseline][metric]).tolist()
+                    one_item['flashmaskv3'] = method_to_df['flashmaskv3'][metric].tolist()
                     if kernel == "fwd":
                         one_item['xlabel'] = 'Fwd Speed (TFLOPs/s)'
                     elif kernel == "bwd":
@@ -160,7 +160,7 @@ def main(baseline: str = "flashmaskv1"):
                         raise ValueError(f"kernel must be fwd or bwd, but got {kernel}")
 
                     categories[f'Sequence length {seqlen//1024}K, head dim {headdim}'] = one_item
-                plot_bar(categories, f'{root_dir}/flashmaskv2_vs_{baseline}_{dtype}_{headdim}_{kernel}', baseline)
+                plot_bar(categories, f'{root_dir}/flashmaskv3_vs_{baseline}_{dtype}_{headdim}_{kernel}', baseline)
 
 if __name__ == "__main__":
     from jsonargparse import ArgumentParser
