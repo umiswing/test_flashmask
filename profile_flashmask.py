@@ -17,9 +17,11 @@ def parse_args():
     parser.add_argument("--d", type=int, default=128, help="Latent dim d")
     parser.add_argument("--dv", type=int, default=128, help="Latent dim dv")
     parser.add_argument("--warmup_times", type=int, default=50, help="Number of times for warmup")
+    parser.add_argument("--profile_times", type=int, default=4, help="Number of times for actual profiling")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="Dtype for attention calculation")
     parser.add_argument("-b", "--backward_prof", default=False, action="store_true", help="Whether to profile backward")
     parser.add_argument("-v", "--verbose", default=False, action="store_true", help="Whether to print runtime config")
+    parser.add_argument("-g", "--generic_fav3", default=False, action="store_true", help="Whether to profile generic FA v3")
     parser.add_argument("--causal", default=False, action="store_true", help="Whether to use causal mask")
     return parser.parse_args()
 
@@ -55,24 +57,13 @@ if __name__ == "__main__":
     k.stop_gradient = NO_BACKWARD
     v.stop_gradient = NO_BACKWARD
 
-    # startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
-    startend_row_indices, causal = (None, opts.causal)
+    if opts.generic_fav3:
+        startend_row_indices, causal = (None, opts.causal)
+    else:
+        startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
 
     paddle.set_flags({'FLAGS_flash_attn_version': 3})
     paddle.set_flags({'FLAGS_cudnn_deterministic': 0})
-
-    out, lse = flashmask_attention(
-        q,
-        k,
-        v,
-        startend_row_indices=startend_row_indices,
-        causal=causal,
-        return_softmax_lse=True
-    )
-
-    g = paddle.randn(shape=out.shape, dtype=out.dtype)
-    if not NO_BACKWARD:
-        out.backward(g)
 
     print(f"Warming up run for {warmup_times} time(s)...")
     for i in tqdm.tqdm(range(warmup_times)):
@@ -84,19 +75,25 @@ if __name__ == "__main__":
             causal=causal,
             return_softmax_lse=True
         )
+        paddle.device.synchronize()
+        print(out.shape)
         if not NO_BACKWARD:
             out.backward(g)
+    print("Warming up completed.")
 
-    if NO_BACKWARD:
-        paddle.base.core.nvprof_nvtx_push("flashmask")
-    out, lse = flashmask_attention(
-        q,
-        k,
-        v,
-        startend_row_indices=startend_row_indices,
-        causal=causal,
-        return_softmax_lse=True
-    )
-    if not NO_BACKWARD:
-        out.backward(g)
-    paddle.base.core.nvprof_nvtx_pop()
+    print(f"Profiling starts for {opts.profile_times} time(s)...")
+    for i in tqdm.tqdm(range(opts.profile_times)):
+        if NO_BACKWARD:
+            paddle.base.core.nvprof_nvtx_push("flashmask")
+        out, lse = flashmask_attention(
+            q,
+            k,
+            v,
+            startend_row_indices=startend_row_indices,
+            causal=causal,
+            return_softmax_lse=True
+        )
+        if not NO_BACKWARD:
+            out.backward(g)
+        paddle.base.core.nvprof_nvtx_pop()
+    print("Profiling completed.")
