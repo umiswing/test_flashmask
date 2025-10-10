@@ -65,7 +65,7 @@ def generate_shapes():
 
 @pytest.mark.parametrize("dtype", [paddle.bfloat16])
 @pytest.mark.parametrize("fa_version", [3])
-@pytest.mark.parametrize("d, dv", [(128, 128)])
+@pytest.mark.parametrize("d, dv", [(128, 128), (80, 80), (64, 64)])
 @pytest.mark.parametrize(
     "batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices",
     list(generate_shapes())
@@ -113,6 +113,10 @@ def test_flashmask(
     v.stop_gradient = False
 
     startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
+
+    if startend_row_indices is None and causal and d == 80:
+      pytest.skip(f"Skipping because running headdim 80 with flash_attn in causal mask")
+
     attn_bias = startend_row_indices_to_attn_bias(startend_row_indices, seqlen_q, nheads, dtype, causal)
 
     out_ref, attn_ref = attention_ref(
