@@ -37,6 +37,20 @@ def plot_radar(categories, save_path, baseline_key,
 
     for idx, (category, data) in enumerate(categories.items()):
         labels = data['labels']
+
+        def replace_space_after_second_word(s):
+            if len(s) <= 15:
+                return s
+            # 找到第二个单词后的空格
+            words = s.split(' ')
+            if len(words) < 3:
+                # 如果不足两个空格，不做处理
+                return s
+            # 重新拼接，在第二个单词后加换行
+            # words[:2]为前两个单词，words[2:]为剩余部分
+            return ' '.join(words[:2]) + '\n' + ' '.join(words[2:])
+
+        labels = [replace_space_after_second_word(x) for x in labels]
         num_vars = len(labels)
         angles = np.linspace(0, 2 * np.pi, num_vars, endpoint=False).tolist()
         angles += angles[:1]  # 闭合曲线
@@ -57,8 +71,9 @@ def plot_radar(categories, save_path, baseline_key,
 
         ax.set_xticks(angles[:-1])
         #ax.set_xticklabels(labels, fontsize=7, fontproperties=font_prop.copy().set_size(7))
-        ax.set_xticklabels(labels, fontsize=7)
-        ax.set_title(category + f" {data['xlabel']}", size=7, fontproperties=font_prop, y=1.12)
+        ax.set_xticklabels(labels, fontsize=9)
+        ax.set_title(category + f" {data['xlabel']}",
+                      size=7, fontproperties=font_prop, y=1.12)
         ax.set_yticklabels([])
 
         max_r = max(max(baseline), max(flashmaskv3))
@@ -79,28 +94,38 @@ def plot_radar(categories, save_path, baseline_key,
             # baseline数值：点的内侧，角度左移
             if show_baseline_label:
                 ax.text(angle - angle_offset, bval - base_offset, f'{bval:.1f}',
-                        color=colors[0], fontsize=7, ha='center', va='center',
+                        color=colors[0], fontsize=9, ha='center', va='center',
                         fontproperties=font_prop,
                         bbox=dict(boxstyle="round,pad=0.18", fc="w", ec=colors[0], lw=0.6, alpha=0.85))
 
             # flashmaskv3数值：点的外侧，角度右移
             if show_flashmaskv3_label:
                 ax.text(angle + angle_offset, fval + outer_offset, f'{fval:.1f}',
-                        color=colors[1], fontsize=7, ha='center', va='center',
+                        color=colors[1], fontsize=9, ha='center', va='center',
                         fontproperties=font_prop,
                         bbox=dict(boxstyle="round,pad=0.18", fc="w", ec=colors[1], lw=0.6, alpha=0.85))
 
             # 提升百分比：更外侧，居中
             if show_percent_label and not np.isnan(inc):
                 ax.text(angle - angle_offset, fval + perc_offset, f'{sign}{inc:.1f}%',
-                        color='#111', fontsize=7, ha='center', va='center',
+                        color='#111', fontsize=9, ha='center', va='center',
                         fontproperties=font_prop, fontweight='bold',
                         bbox=dict(boxstyle="round,pad=0.19", fc="#f7f7f7", ec='#111', lw=0.7, alpha=0.7))
 
     handles, legend_labels = axs[0].get_legend_handles_labels()
+
+    legend_labels = [
+        (lambda s: s.replace('old_flashmaskv3', 'FlashMask V3 B.O.')
+                    .replace('flashmaskv3', 'FlashMask V3')
+                    .replace('flashmaskv1', 'FlashMask V1')
+                    .replace('flexattention', 'FlexAttention')
+        )(x)
+        for x in legend_labels
+    ]
+
     fig.legend(
         handles, legend_labels, loc='upper center', ncol=2,
-        prop=font_prop.copy().set_size(7), frameon=False
+        prop=font_prop.copy().set_size(12), frameon=False
     )
 
     plt.tight_layout(rect=[0, 0, 1, 0.93])
@@ -205,7 +230,7 @@ def main(baseline: str = "flashmaskv1"):
     
     root_dir = '.'
     # for dtype in ['bf16', 'fp16']:
-    for kernel in ["fwd", "bwd"]:
+    for kernel in ["fwd", "bwd", "total"]:
         for dtype in ['bf16']:
             # for headdim in [128, 64]:
             for headdim in [128]:
@@ -222,6 +247,8 @@ def main(baseline: str = "flashmaskv1"):
                             metric = '  FW TFLOPs/s'
                         elif kernel == "bwd":
                             metric = '  BW TFLOPs/s'
+                        elif kernel == "total":
+                            metric = '  TOTAL TFLOPs/s'
                         else:
                             raise ValueError(f"kernel must be fwd or bwd, but got {kernel}")
 
@@ -250,13 +277,15 @@ def main(baseline: str = "flashmaskv1"):
                         one_item['xlabel'] = 'Fwd Speed (TFLOPs/s)'
                     elif kernel == "bwd":
                         one_item['xlabel'] = 'Bwd Speed (TFLOPs/s)'
+                    elif kernel == "total":
+                        one_item['xlabel'] = 'Total Speed (TFLOPs/s)'
                     else:
                         raise ValueError(f"kernel must be fwd or bwd, but got {kernel}")
 
                     categories[f'Sequence length {seqlen//1024}K, head dim {headdim}'] = one_item
                 #plot_bar(categories, f'{root_dir}/flashmaskv3_vs_{baseline}_{dtype}_{headdim}_{kernel}', baseline)
-                #plot_radar(categories, f'{root_dir}/flashmaskv3_vs_{baseline}_{dtype}_{headdim}_{kernel}', baseline, show_baseline_label=False, show_flashmaskv3_label=False, show_percent_label=True)
-                plot_radar(categories, f'{root_dir}/flashmaskv3_vs_{baseline}_{dtype}_{headdim}_{kernel}', baseline)
+                plot_radar(categories, f'{root_dir}/flashmaskv3_vs_{baseline}_{dtype}_{headdim}_{kernel}', baseline, show_baseline_label=False, show_flashmaskv3_label=False, show_percent_label=True)
+                #plot_radar(categories, f'{root_dir}/flashmaskv3_vs_{baseline}_{dtype}_{headdim}_{kernel}', baseline)
 
 if __name__ == "__main__":
     from jsonargparse import ArgumentParser
