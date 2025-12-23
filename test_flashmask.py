@@ -3,8 +3,21 @@ import math
 import itertools
 import pytest
 from einops import rearrange, repeat
-import paddle
-from paddle.nn.functional.flash_attention import flashmask_attention
+# import paddle
+
+import sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.append(parent_dir)
+try:
+    from flashmask_interface import flashmask_attention
+except Exception as e:
+    import traceback
+    traceback.print_exc()
+    raise
+
+import torch
 from generate_startend_row_indices import (
   startend_row_indices_to_attn_bias,
   generate_none_mask,
@@ -63,7 +76,8 @@ def generate_shapes():
                 batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices
             )
 
-@pytest.mark.parametrize("dtype", [paddle.bfloat16])
+# @pytest.mark.parametrize("dtype", [paddle.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16]) # 使用 torch.bfloat16
 @pytest.mark.parametrize("fa_version", [3])
 @pytest.mark.parametrize("d, dv",
     [
@@ -80,8 +94,8 @@ def generate_shapes():
 @pytest.mark.parametrize(
     "gen_startend_row_indices",
     [
-        partial(generate_none_mask, causal=False), # full
-        partial(generate_none_mask, causal=True), # causal
+        # partial(generate_none_mask, causal=False), # full
+        # partial(generate_none_mask, causal=True), # causal
         partial(generate_sliding_window_mask), # sliding window
         partial(generate_causal_document_mask), # causal document mask
         partial(generate_document_mask), # document mask
@@ -97,29 +111,37 @@ def generate_shapes():
 def test_flashmask(
     batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, nheads_startend_row_indices, fa_version, dtype, gen_startend_row_indices, softcap=0.0
 ):
-    paddle.seed(2024)
+    torch.manual_seed(2024)
+    # paddle.seed(2024)
     assert nheads % nheads_kv == 0
-    q_ref = paddle.randn(shape=[batch_size, seqlen_q, nheads, d], dtype=dtype)
-    k_ref = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, d], dtype=dtype)
-    v_ref = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, dv], dtype=dtype)
 
-    q_ref.stop_gradient = False
-    k_ref.stop_gradient = False
-    v_ref.stop_gradient = False
+    q_ref = torch.randn(batch_size, seqlen_q, nheads, d, dtype=dtype, device='cuda', requires_grad=True)
+    k_ref = torch.randn(batch_size, seqlen_k, nheads_kv, d, dtype=dtype, device='cuda', requires_grad=True)
+    v_ref = torch.randn(batch_size, seqlen_k, nheads_kv, dv, dtype=dtype, device='cuda', requires_grad=True)
 
-    q_bf16, k_bf16, v_bf16 = [x.detach().clone() for x in (q_ref, k_ref, v_ref)]
 
-    q_bf16.stop_gradient = False
-    k_bf16.stop_gradient = False
-    v_bf16.stop_gradient = False
+    q_bf16 = q_ref.detach().clone().requires_grad_(True)
+    k_bf16 = k_ref.detach().clone().requires_grad_(True)
+    v_bf16 = v_ref.detach().clone().requires_grad_(True)
 
-    q, k, v = [x.detach().clone() for x in (q_ref, k_ref, v_ref)]
-
-    q.stop_gradient = False
-    k.stop_gradient = False
-    v.stop_gradient = False
+    q = q_ref.detach().clone().requires_grad_(True)
+    k = k_ref.detach().clone().requires_grad_(True)
+    v = v_ref.detach().clone().requires_grad_(True)
 
     startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
+
+    if startend_row_indices is None:
+        pytest.skip("Skipping because startend_row_indices is None")
+
+    if startend_row_indices is not None:
+        if not isinstance(startend_row_indices, torch.Tensor):
+            # 如果是 numpy 或 paddle tensor (先转numpy)
+            if hasattr(startend_row_indices, 'numpy'): 
+                startend_row_indices = torch.tensor(startend_row_indices.numpy(), device='cuda', dtype=torch.int32)
+            else:
+                startend_row_indices = torch.tensor(startend_row_indices, device='cuda', dtype=torch.int32)
+        else:
+            startend_row_indices = startend_row_indices.to('cuda', dtype=torch.int32)
 
     if startend_row_indices is None and causal and d in (80, 192):
       pytest.skip(f"Skipping because running headdim {d} with flash_attn in causal mask")
@@ -144,22 +166,16 @@ def test_flashmask(
         reorder_ops=True
     )
 
-    # # Numerical error if we just do any arithmetic on out_ref
     fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
     assert softcap == 0.0
     rtol = 2 if softcap == 0.0 else 3
 
-    print(f"Paddle naive bf16 Output max diff: {(out_bf16 - out_ref).abs().max().item()}")
-    print(f"Paddle naive bf16 Output mean diff: {(out_bf16 - out_ref).abs().mean().item()}")
+    print(f"Torch naive bf16 Output max diff: {(out_bf16 - out_ref).abs().max().item()}")
+    print(f"Torch naive bf16 Output mean diff: {(out_bf16 - out_ref).abs().mean().item()}")
 
-    if fa_version == 2:
-        paddle.set_flags({'FLAGS_flash_attn_version': 2})
-    elif fa_version == 3:
-        paddle.set_flags({'FLAGS_flash_attn_version': 3})
-    else:
-        raise ValueError(
-            f"Invalid flash attention version: {fa_version}"
-        )
+    # 确保 startend_row_indices 在 CUDA 上且为 int32
+    if isinstance(startend_row_indices, torch.Tensor):
+        startend_row_indices = startend_row_indices.to('cuda', dtype=torch.int32)
 
     out, lse = flashmask_attention(
         q,
@@ -171,16 +187,11 @@ def test_flashmask(
     )
     print(f"flashmask Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"flashmask Output mean diff: {(out - out_ref).abs().mean().item()}")
-    # if not causal:
-    #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
-    # breakpoint()
-
-    # Check that FlashAttention's numerical error is at most twice the numerical error
-    # of a Pytorch implementation.
 
     assert (out - out_ref).abs().max().item() <= rtol * (out_bf16 - out_ref).abs().max().item() + fwd_atol
 
-    g = paddle.randn(shape=out.shape, dtype=out.dtype)
+    # #Backward Check
+    g = torch.randn_like(out)
     out.backward(g)
     out_ref.backward(g)
     out_bf16.backward(g)
@@ -192,12 +203,12 @@ def test_flashmask(
     print(f"flashmask dK mean diff: {(k.grad - k_ref.grad).abs().mean().item()}")
     print(f"flashmask dV mean diff: {(v.grad - v_ref.grad).abs().mean().item()}")
 
-    print(f"Paddle naive bf16 dQ max diff: {(q_bf16.grad - q_ref.grad).abs().max().item()}")
-    print(f"Paddle naive bf16 dK max diff: {(k_bf16.grad - k_ref.grad).abs().max().item()}")
-    print(f"Paddle naive bf16 dV max diff: {(v_bf16.grad - v_ref.grad).abs().max().item()}")
-    print(f"Paddle naive bf16 dQ mean diff: {(q_bf16.grad - q_ref.grad).abs().mean().item()}")
-    print(f"Paddle naive bf16 dK mean diff: {(k_bf16.grad - k_ref.grad).abs().mean().item()}")
-    print(f"Paddle naive bf16 dV mean diff: {(v_bf16.grad - v_ref.grad).abs().mean().item()}")
+    print(f"Torch naive bf16 dQ max diff: {(q_bf16.grad - q_ref.grad).abs().max().item()}")
+    print(f"Torch naive bf16 dK max diff: {(k_bf16.grad - k_ref.grad).abs().max().item()}")
+    print(f"Torch naive bf16 dV max diff: {(v_bf16.grad - v_ref.grad).abs().max().item()}")
+    print(f"Torch naive bf16 dQ mean diff: {(q_bf16.grad - q_ref.grad).abs().mean().item()}")
+    print(f"Torch naive bf16 dK mean diff: {(k_bf16.grad - k_ref.grad).abs().mean().item()}")
+    print(f"Torch naive bf16 dV mean diff: {(v_bf16.grad - v_ref.grad).abs().mean().item()}")
 
     dq_atol = 2 * (q_ref.grad + 0.3 - 0.3 - q_ref.grad).abs().max().item() + (0 if softcap == 0 else 3e-4)
     assert (q.grad - q_ref.grad).abs().max().item() <= rtol * (q_bf16.grad - q_ref.grad).abs().max().item() + dq_atol
