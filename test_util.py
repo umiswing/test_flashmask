@@ -1,6 +1,7 @@
 import math
 from einops import repeat, rearrange
-import paddle
+# import paddle
+import torch 
 from einops import rearrange, repeat
 
 import numpy as np
@@ -13,13 +14,21 @@ def construct_local_mask(
     query_padding_mask=None,
     key_padding_mask=None,
     key_leftpad=None,
+    device=None,
 ):
-    row_idx = rearrange(paddle.arange(seqlen_q, dtype=paddle.int64), "s -> s 1")
-    col_idx = paddle.arange(seqlen_k, dtype=paddle.int64)
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # row_idx = rearrange(paddle.arange(seqlen_q, dtype=paddle.int64), "s -> s 1")
+    # col_idx = paddle.arange(seqlen_k, dtype=paddle.int64)
+
+    row_idx = rearrange(torch.arange(seqlen_q, dtype=torch.int64, device=device), "s -> s 1")
+    col_idx = torch.arange(seqlen_k, dtype=torch.int64, device=device)
     if key_leftpad is not None:
         key_leftpad = rearrange(key_leftpad, "b -> b 1 1 1")
         col_idx = repeat(col_idx, "s -> b 1 1 s", b=key_leftpad.shape[0])
-        col_idx = paddle.where(col_idx >= key_leftpad, col_idx - key_leftpad, 2**32)
+        val_inf = torch.tensor(2**32, device=device, dtype=torch.int64)
+        col_idx = torch.where(col_idx >= key_leftpad, col_idx - key_leftpad, 2**32)
     sk = (
         seqlen_k
         if key_padding_mask is None
@@ -33,10 +42,10 @@ def construct_local_mask(
     if window_size[0] < 0:
         return col_idx > row_idx + sk - sq + window_size[1]
     else:
-        sk = paddle.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
-        return paddle.logical_or(
-            col_idx > paddle.minimum(row_idx + sk - sq + window_size[1], sk),
-            paddle.logical_and(col_idx < row_idx + sk - sq - window_size[0], col_idx >= sink_token_length),
+        sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
+        return torch.logical_or(
+            col_idx > torch.minimum(row_idx + sk - sq + window_size[1], sk),
+            torch.logical_and(col_idx < row_idx + sk - sq - window_size[0], col_idx >= sink_token_length),
         )
 
 def attention_ref(
@@ -85,54 +94,63 @@ def attention_ref(
         window_size = (window_size[0], 0)
     dtype_og = q.dtype
     if upcast:
-        q = paddle.cast(q, paddle.float32)
-        k = paddle.cast(k, paddle.float32)
-        v = paddle.cast(v, paddle.float32)
+        q = q.to(torch.float32)
+        k = k.to(torch.float32)
+        v = v.to(torch.float32)
         if qv is not None:
-            qv = paddle.cast(qv, paddle.float32)
+            qv = qv.to(torch.float32)
 
     if q_descale is not None:
-        assert False
-        q_descale = repeat(q_descale, "b h -> b 1 (h g) 1", g=q.shape[2] // k.shape[2])
-        q = (q.cast(paddle.float32) * q_descale).cast(q.dtype)
-        qv = (qv.cast(paddle.float32) * q_descale).cast(qv.dtype) if qv is not None else None
+        assert False 
+        # Paddle: repeat(q_descale, "b h -> b 1 (h g) 1", g=q.shape[2] // k.shape[2])
+        g = q.shape[2] // k.shape[2]
+        q_descale = repeat(q_descale, "b h -> b 1 (h g) 1", g=g)
+        q = (q.to(torch.float32) * q_descale).to(q.dtype)
+        if qv is not None:
+            qv = (qv.to(torch.float32) * q_descale).to(qv.dtype)
 
     if k_descale is not None:
         assert False
-        k = (k.cast(paddle.float32) * rearrange(k_descale, "b h -> b 1 h 1")).cast(k.dtype)
+        k_descale_r = rearrange(k_descale, "b h -> b 1 h 1")
+        k = (k.to(torch.float32) * k_descale_r).to(k.dtype)
 
     if v_descale is not None:
         assert False
-        v = (v.cast(paddle.float32) * rearrange(v_descale, "b h -> b 1 h 1")).cast(v.dtype)
+        v_descale_r = rearrange(v_descale, "b h -> b 1 h 1")
+        v = (v.to(torch.float32) * v_descale_r).to(v.dtype)
 
     seqlen_q, seqlen_k = q.shape[1], k.shape[1]
 
     # (batch_size, seqlen, nheads, head_dim) -> (batch_size, nheads, seqlen, head_dim)
-    q = paddle.transpose(q, [0, 2, 1, 3])
-    k = paddle.transpose(k, [0, 2, 1, 3])
-    v = paddle.transpose(v, [0, 2, 1, 3])
+    # q = paddle.transpose(q, [0, 2, 1, 3])
+    # k = paddle.transpose(k, [0, 2, 1, 3])
+    # v = paddle.transpose(v, [0, 2, 1, 3])
+    q = q.permute(0, 2, 1, 3)
+    k = k.permute(0, 2, 1, 3)
+    v = v.permute(0, 2, 1, 3)
 
     k = repeat(k, "b h s d -> b (h g) s d", g=q.shape[1] // k.shape[1])
     v = repeat(v, "b h s d -> b (h g) s d", g=q.shape[1] // v.shape[1])
     if attn_bias is not None:
-        attn_bias = repeat(attn_bias, "b h s d -> b (h g) s d ", g=q.shape[1] // attn_bias.shape[1])
+        attn_bias = attn_bias.to(q.device)
+        if attn_bias.ndim == 4 and attn_bias.shape[1] != q.shape[1]:
+             attn_bias = repeat(attn_bias, "b h s d -> b (h g) s d ", g=q.shape[1] // attn_bias.shape[1])
 
     d = q.shape[-1]
     dv = v.shape[-1]
     softmax_scale = 1.0 / math.sqrt(d if qv is None else d + dv)
 
     if not reorder_ops:
-        scores = paddle.matmul(q * softmax_scale, k, transpose_y=True)
+        scores = torch.matmul(q * softmax_scale, k.transpose(-2, -1))
     else:
-        scores = paddle.matmul(q, k * softmax_scale, transpose_y=True)
+        scores = torch.matmul(q, k.transpose(-2, -1) * softmax_scale)
 
     if qv is not None:
         assert False
-        scores = scores + paddle.matmul(qv * softmax_scale, v, transpose_y=True)
+        scores = scores + torch.matmul(qv * softmax_scale, v.transpose(-2, -1))
 
     if softcap > 0:
-        assert False
-        scores = paddle.tanh(scores / softcap) * softcap
+        scores = torch.tanh(scores / softcap) * softcap
 
     if key_padding_mask is not None:
         assert False
@@ -148,51 +166,53 @@ def attention_ref(
             query_padding_mask,
             key_padding_mask,
             key_leftpad=key_leftpad,
+            device=q.device
         )
     if attention_chunk > 0:
         assert False
-        chunk_mask = construct_chunk_mask(
-            seqlen_q,
-            seqlen_k,
-            attention_chunk,
-            query_padding_mask,
-            key_padding_mask,
-            key_leftpad=key_leftpad,
-            device=q.device,
-        )
-        local_mask = paddle.logical_or(local_mask, chunk_mask) if local_mask is not None else chunk_mask
+        # chunk_mask = construct_chunk_mask(
+        #     seqlen_q,
+        #     seqlen_k,
+        #     attention_chunk,
+        #     query_padding_mask,
+        #     key_padding_mask,
+        #     key_leftpad=key_leftpad,
+        #     device=q.device,
+        # )
+        # local_mask = paddle.logical_or(local_mask, chunk_mask) if local_mask is not None else chunk_mask
 
     if local_mask is not None:
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
-        scores = scores + attn_bias.cast(paddle.float32)
+        scores = scores + attn_bias.to(torch.float32)
         # print("scores:", scores[0,0,0,:])
         # when all values in a line of attn_bias are -inf, setting value in this line to a very small value
         # to prevend softmax giving nan output
-        all_inf_mask = (attn_bias == -np.inf).all(axis=-1, keepdim=True)
-        scores = paddle.where(all_inf_mask, paddle.full_like(scores, -1e9), scores)
+        all_inf_mask = (attn_bias == -float('inf')).all(dim=-1, keepdim=True)
+        scores = torch.where(all_inf_mask, torch.full_like(scores, -1e9), scores)
 
-    attention = paddle.nn.functional.softmax(scores, axis=-1).cast(v.dtype)
+    attention = torch.softmax(scores, dim=-1).to(v.dtype)
 
     if attn_bias is not None:
         # when all values in a line of attn_bias are -inf, we setting value in this line to a very small value
         # to prevend softmax giving nan output, however, after softmax, values in this line become 1/seqlen,
         # so setting them to 0 after softmax
-        attention = paddle.where(all_inf_mask, paddle.zeros_like(attention), attention)
+        attention = torch.where(all_inf_mask, torch.zeros_like(attention), attention)
 
     # We want to mask here so that the attention matrix doesn't have any NaNs
     # Otherwise we'll get NaN in dV
     if query_padding_mask is not None:
         assert False
-        attention = attention.masked_fill(rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0)
+        # attention = attention.masked_fill(rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0)
 
     # Without this we might get NaN in dv
     if key_padding_mask is not None:
         assert False
-        attention = attention.masked_fill(rearrange(~key_padding_mask, "b s -> b 1 1 s"), 0.0)
+        # attention = attention.masked_fill(rearrange(~key_padding_mask, "b s -> b 1 1 s"), 0.0)
+
     # Some rows might be completely masked out so we fill them with zero instead of NaN
     if local_mask is not None:
-        attention = attention.masked_fill(paddle.all(local_mask, axis=-1, keepdim=True), 0.0)
+        attention = attention.masked_fill(torch.all(local_mask, dim=-1, keepdim=True), 0.0)
     dropout_scaling = 1.0 / (1 - dropout_p)
     # attention_drop = attention.masked_fill(~dropout_mask, 0.0) * dropout_scaling
     # output = paddle.matmul(attention_drop, v, transpose_y=True)
@@ -202,53 +222,60 @@ def attention_ref(
     else:
         attention_drop = attention
     if intermediate_dtype is not None:
-        attention_drop = attention_drop.cast(intermediate_dtype).cast(attention_drop.dtype)
-    output = paddle.matmul(attention_drop, v * dropout_scaling)
-    output = paddle.transpose(output, [0, 2, 1, 3])
+        attention_drop = attention_drop.to(intermediate_dtype).to(attention_drop.dtype)
+    output = torch.matmul(attention_drop, v * dropout_scaling)
+    output = output.permute(0, 2, 1, 3) # Back to (b, s, h, d)
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
-    return output.cast(dtype=dtype_og), attention.cast(dtype=dtype_og)
+    return output.to(dtype_og), attention.to(dtype_og)
 
 
 #blockmask utils
-def random_blockmask(shape, dtype='int32',is_causal=False, ref_q = None):
+def random_blockmask(shape, dtype=torch.int32, is_causal=False, ref_q=None, device='cuda'):
     # 随机生成 0/1 mask
-    mask = paddle.randint(0, 2, shape, dtype=paddle.int32)
+    mask = torch.randint(0, 2, shape, dtype=dtype, device=device)
     B, S, Q, K = shape
     return mask
 
 def flashmask_to_densemask(startend_row_indices, seqlen_q, nheads, causal=True):
     if startend_row_indices is None:
         return None
-    bz, num_head, seqlen_k, bound_num = startend_row_indices.shape
+    if not isinstance(startend_row_indices, torch.Tensor):
+        startend_row_indices = torch.tensor(startend_row_indices, device='cuda')
+    startend_cpu = startend_row_indices.detach().cpu().numpy()
+    bz, num_head, seqlen_k, bound_num = startend_cpu.shape
     assert nheads % num_head == 0
-    m = paddle.ones((bz, num_head, seqlen_q, seqlen_k), dtype=paddle.int32)
+    m_cpu = np.ones((bz, num_head, seqlen_q, seqlen_k), dtype=np.int32)
     has_end = (causal and bound_num == 2) or ((not causal) and bound_num == 4)
     for bi in range(bz):
         for hi in range(num_head):
             for j in range(seqlen_k):
-                downstart = startend_row_indices[bi, hi, j, 0]
+                downstart = startend_cpu[bi, hi, j, 0]
                 if has_end:
-                    downend = startend_row_indices[bi, hi, j, 1]
-                    m[bi, hi, downstart:downend, j] = 0
+                    downend = startend_cpu[bi, hi, j, 1]
+                    m_cpu[bi, hi, downstart:downend, j] = 0
                 else:
-                    m[bi, hi, downstart:, j] = 0
+                    m_cpu[bi, hi, downstart:, j] = 0
                 if causal:
                     # from flash-attention 2.1 and in flash-attention 3, If seqlen_q != seqlen_k and causal=True,
                     # the causal mask is aligned to the bottom right corner of the attention matrix,
                     # instead of the top-left corner.
                     # See: https://github.com/Dao-AILab/flash-attention?tab=readme-ov-file#21-change-behavior-of-causal-flag
-                    m[bi, hi, :max(0, j - (seqlen_k - seqlen_q)), j] = 0
+                    row_limit = max(0, j - (seqlen_k - seqlen_q))
+                    #有疑问
+                    m_cpu[bi, hi, :row_limit, j] = 0
                 else:
                     if has_end:
-                        upstart = startend_row_indices[bi, hi, j, 2]
-                        upend = startend_row_indices[bi, hi, j, 3]
-                        m[bi, hi, upstart:upend, j] = 0
+                        upstart = startend_cpu[bi, hi, j, 2]
+                        upend = startend_cpu[bi, hi, j, 3]
+                        m_cpu[bi, hi, upstart:upend, j] = 0
                     else:
-                        upend = startend_row_indices[bi, hi, j, 1]
-                        m[bi, hi, :upend, j] = 0
-    m = paddle.repeat_interleave(x=m, repeats=nheads // num_head, axis=1)
-    m = m.astype(paddle.bool)
+                        upend = startend_cpu[bi, hi, j, 1]
+                        m_cpu[bi, hi, :upend, j] = 0
+    device = startend_row_indices.device if startend_row_indices.is_cuda else 'cuda'
+    m = torch.tensor(m_cpu, device=device, dtype=torch.int32)
+    m = torch.repeat_interleave(m, repeats=nheads // num_head, dim=1)
+    m = m.to(torch.bool)
     return m
 
 def blockmask_to_densemask(blockmask, q_len, k_len, dtype, causal=True):
@@ -270,8 +297,8 @@ def blockmask_to_densemask(blockmask, q_len, k_len, dtype, causal=True):
     block_k = 128
 
     # 1. 展开到[bs, s, q_len, k_len]
-    densemask = blockmask.astype(dtype).repeat_interleave(block_q, axis=2).repeat_interleave(block_k, axis=3)
+    densemask = blockmask.to(dtype).repeat_interleave(block_q, dim=2).repeat_interleave(block_k, dim=3)
     densemask = densemask[:, :, :q_len, :k_len]
     # print(densemask)
 
-    return densemask.astype(paddle.bool)
+    return densemask.to(torch.bool)
