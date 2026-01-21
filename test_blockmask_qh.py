@@ -10,14 +10,23 @@ from generate_startend_row_indices import (
   startend_row_indices_to_attn_bias,
   generate_none_mask,
   generate_sliding_window_mask,
+  generate_sliding_window_mask_distinct_heads,
   generate_causal_document_mask,
+  generate_causal_document_mask_distinct_heads,
   generate_document_mask,
+  generate_document_mask_distinct_heads,
   generate_share_question_mask,
+  generate_share_question_mask_distinct_heads,
   generate_global_sliding_window_mask,
+  generate_global_sliding_window_mask_distinct_heads,
   generate_causal_blockwise_mask,
+  generate_causal_blockwise_mask_distinct_heads,
   generate_prefix_lm_document_mask,
+  generate_prefix_lm_document_mask_distinct_heads,
   generate_prefix_lm_causal_mask,
+  generate_prefix_lm_causal_mask_distinct_heads,
   generate_qk_sparse_mask,
+  generate_qk_sparse_mask_distinct_heads,
   generate_random_eviction_mask
 )
 from functools import partial
@@ -90,20 +99,38 @@ def _expand_startend_row_indices_heads(startend_row_indices, target_num_heads: i
 )
 @pytest.mark.parametrize(
     "gen_startend_row_indices",
-    [
-        # partial(generate_none_mask, causal=False), # full
-        # partial(generate_none_mask, causal=True), # causal
-        partial(generate_sliding_window_mask), # sliding window
-        partial(generate_causal_document_mask), # causal document mask
-        partial(generate_document_mask), # document mask
-        partial(generate_share_question_mask), # share question mask
-        partial(generate_global_sliding_window_mask), # global sliding window
-        partial(generate_causal_blockwise_mask), # causal blockwise mask
-        partial(generate_prefix_lm_document_mask), # prefix lm document mask
-        partial(generate_prefix_lm_causal_mask), # prefix lm causal mask
-        partial(generate_qk_sparse_mask), # qk-sparse mask
-        partial(generate_random_eviction_mask), # random eviction mask
-    ],
+    (
+        [
+            # partial(generate_none_mask, causal=False), # full
+            # partial(generate_none_mask, causal=True), # causal
+            partial(generate_sliding_window_mask), # sliding window
+            partial(generate_causal_document_mask), # causal document mask
+            partial(generate_document_mask), # document mask
+            partial(generate_share_question_mask), # share question mask
+            partial(generate_global_sliding_window_mask), # global sliding window
+            partial(generate_causal_blockwise_mask), # causal blockwise mask
+            partial(generate_prefix_lm_document_mask), # prefix lm document mask
+            partial(generate_prefix_lm_causal_mask), # prefix lm causal mask
+            partial(generate_qk_sparse_mask), # qk-sparse mask
+            partial(generate_random_eviction_mask), # random eviction mask
+        ]
+        + (
+            [
+                # Enable per-query-head distinct payload tests explicitly to avoid case explosion by default.
+                partial(generate_sliding_window_mask_distinct_heads),
+                partial(generate_causal_document_mask_distinct_heads),
+                partial(generate_document_mask_distinct_heads),
+                partial(generate_share_question_mask_distinct_heads),
+                partial(generate_global_sliding_window_mask_distinct_heads),
+                partial(generate_causal_blockwise_mask_distinct_heads),
+                partial(generate_prefix_lm_document_mask_distinct_heads),
+                partial(generate_prefix_lm_causal_mask_distinct_heads),
+                partial(generate_qk_sparse_mask_distinct_heads),
+            ]
+            if os.getenv("FLASHMASK_TEST_DISTINCT_HEADS", "0") == "1"
+            else []
+        )
+    ),
 )
 def test_flashmask(
     batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, nheads_startend_row_indices, fa_version, dtype, gen_startend_row_indices, softcap=0.0
