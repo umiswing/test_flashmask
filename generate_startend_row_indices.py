@@ -1,6 +1,91 @@
 import paddle
 import numpy as np
 
+def _scale_int_list(values, seqlen_k: int, base_seqlen_k: int = 8192, min_value: int = 1):
+    scale = seqlen_k / base_seqlen_k
+    return [max(min_value, int(v * scale)) for v in values]
+
+def _default_doc_seqlens_int(seqlen_k: int):
+    # Keep in sync with the defaults used by generate_{causal_,}document_mask/share_question/causal_blockwise.
+    doc_seqlens = [2538, 1742, 3213]
+    if seqlen_k != 8192:
+        doc_seqlens = _scale_int_list(doc_seqlens, seqlen_k=seqlen_k)
+    return doc_seqlens
+
+def _default_doc_seqlens_prefix_pairs(seqlen_k: int):
+    # Keep in sync with the defaults used by generate_prefix_lm_document_mask.
+    doc_seqlens = [(1024, 2538), (1742, 1742), (512, 3213)]
+    if seqlen_k != 8192:
+        scale = seqlen_k / 8192
+        doc_seqlens = [tuple(max(1, int(v * scale)) for v in pair) for pair in doc_seqlens]
+    return doc_seqlens
+
+def _perturb_doc_seqlens_int(doc_seqlens, head_idx: int, seqlen_k: int):
+    """
+    Deterministically perturb integer segment lengths to avoid identical per-head masks,
+    even when `doc_seqlens` is None.
+    """
+    if not doc_seqlens:
+        return doc_seqlens
+    if len(doc_seqlens) == 1:
+        return [min(seqlen_k, max(1, int(doc_seqlens[0]) + ((head_idx % 3) - 1)))]
+
+    segs = [max(1, int(v)) for v in doc_seqlens]
+    delta = int((head_idx * 7) % 17) - 8  # [-8, 8], period 17
+    if delta == 0:
+        delta = 1
+    i = head_idx % len(segs)
+    j = (i + 1) % len(segs)
+
+    segs[i] = max(1, segs[i] + delta)
+    segs[j] = max(1, segs[j] - delta)
+
+    total = sum(segs)
+    if total > seqlen_k:
+        excess = total - seqlen_k
+        k = max(range(len(segs)), key=lambda t: segs[t])
+        segs[k] = max(1, segs[k] - excess)
+    return segs
+
+def _perturb_doc_seqlens_prefix_pairs(doc_seqlens, head_idx: int, seqlen_k: int):
+    """
+    Deterministically perturb prefix-LM (prefix_length, seq_length) segments per head.
+    Keeps 0 <= prefix_length <= seq_length and sum(seq_length) <= seqlen_k.
+    """
+    if not doc_seqlens:
+        return doc_seqlens
+    pairs = [(max(0, int(p)), max(1, int(s))) for p, s in doc_seqlens]
+    if len(pairs) == 1:
+        p, s = pairs[0]
+        p = min(s, max(0, p + ((head_idx % 5) - 2)))
+        s = min(seqlen_k, max(1, s + ((head_idx % 3) - 1)))
+        p = min(p, s)
+        return [(p, s)]
+
+    delta = int((head_idx * 7) % 17) - 8
+    if delta == 0:
+        delta = 1
+    i = head_idx % len(pairs)
+    j = (i + 1) % len(pairs)
+
+    prefixes = [p for p, _ in pairs]
+    lengths = [s for _, s in pairs]
+
+    lengths[i] = max(1, lengths[i] + delta)
+    lengths[j] = max(1, lengths[j] - delta)
+
+    prefixes[i] = min(lengths[i], max(0, prefixes[i] + (delta // 2)))
+    prefixes[j] = min(lengths[j], max(0, prefixes[j] - (delta // 2)))
+
+    total = sum(lengths)
+    if total > seqlen_k:
+        excess = total - seqlen_k
+        k = max(range(len(lengths)), key=lambda t: lengths[t])
+        lengths[k] = max(1, lengths[k] - excess)
+        prefixes[k] = min(prefixes[k], lengths[k])
+
+    return list(zip(prefixes, lengths))
+
 def _rotate_list(values, shift: int):
     if not values:
         return values
@@ -135,11 +220,13 @@ def generate_causal_document_mask_distinct_heads(batch_size, seqlen_q, seqlen_k,
     Per-head distinct causal document mask via rotating document segments per head.
     Output shape: [b, h, seqlen_k, 1]
     """
+    base_doc_seqlens = _default_doc_seqlens_int(seqlen_k) if doc_seqlens is None else list(doc_seqlens)
+
     def _per_head(head_idx: int):
-        if doc_seqlens is None:
-            return generate_causal_document_mask(batch_size, seqlen_q, seqlen_k, 1, None)
+        per_head = _rotate_list(list(base_doc_seqlens), head_idx)
+        per_head = _perturb_doc_seqlens_int(per_head, head_idx=head_idx, seqlen_k=seqlen_k)
         return generate_causal_document_mask(
-            batch_size, seqlen_q, seqlen_k, 1, _rotate_list(list(doc_seqlens), head_idx)
+            batch_size, seqlen_q, seqlen_k, 1, per_head
         )
 
     return _stack_per_head_startend_row_indices(batch_size, seqlen_q, seqlen_k, h, _per_head)
@@ -188,11 +275,13 @@ def generate_document_mask_distinct_heads(batch_size, seqlen_q, seqlen_k, h, doc
     Per-head distinct bidirectional document mask via rotating document segments per head.
     Output shape: [b, h, seqlen_k, 2]
     """
+    base_doc_seqlens = _default_doc_seqlens_int(seqlen_k) if doc_seqlens is None else list(doc_seqlens)
+
     def _per_head(head_idx: int):
-        if doc_seqlens is None:
-            return generate_document_mask(batch_size, seqlen_q, seqlen_k, 1, None)
+        per_head = _rotate_list(list(base_doc_seqlens), head_idx)
+        per_head = _perturb_doc_seqlens_int(per_head, head_idx=head_idx, seqlen_k=seqlen_k)
         return generate_document_mask(
-            batch_size, seqlen_q, seqlen_k, 1, _rotate_list(list(doc_seqlens), head_idx)
+            batch_size, seqlen_q, seqlen_k, 1, per_head
         )
 
     return _stack_per_head_startend_row_indices(batch_size, seqlen_q, seqlen_k, h, _per_head)
@@ -234,11 +323,13 @@ def generate_share_question_mask_distinct_heads(batch_size, seqlen_q, seqlen_k, 
     Per-head distinct share-question mask via rotating document segments per head.
     Output shape: [b, h, seqlen_k, 1]
     """
+    base_doc_seqlens = _default_doc_seqlens_int(seqlen_k) if doc_seqlens is None else list(doc_seqlens)
+
     def _per_head(head_idx: int):
-        if doc_seqlens is None:
-            return generate_share_question_mask(batch_size, seqlen_q, seqlen_k, 1, None)
+        per_head = _rotate_list(list(base_doc_seqlens), head_idx)
+        per_head = _perturb_doc_seqlens_int(per_head, head_idx=head_idx, seqlen_k=seqlen_k)
         return generate_share_question_mask(
-            batch_size, seqlen_q, seqlen_k, 1, _rotate_list(list(doc_seqlens), head_idx)
+            batch_size, seqlen_q, seqlen_k, 1, per_head
         )
 
     return _stack_per_head_startend_row_indices(batch_size, seqlen_q, seqlen_k, h, _per_head)
@@ -363,11 +454,13 @@ def generate_causal_blockwise_mask_distinct_heads(batch_size, seqlen_q, seqlen_k
     Per-head distinct causal blockwise mask via rotating document segments per head.
     Output shape: [b, h, seqlen_k, 2]
     """
+    base_doc_seqlens = _default_doc_seqlens_int(seqlen_k) if doc_seqlens is None else list(doc_seqlens)
+
     def _per_head(head_idx: int):
-        if doc_seqlens is None:
-            return generate_causal_blockwise_mask(batch_size, seqlen_q, seqlen_k, 1, None)
+        per_head = _rotate_list(list(base_doc_seqlens), head_idx)
+        per_head = _perturb_doc_seqlens_int(per_head, head_idx=head_idx, seqlen_k=seqlen_k)
         return generate_causal_blockwise_mask(
-            batch_size, seqlen_q, seqlen_k, 1, _rotate_list(list(doc_seqlens), head_idx)
+            batch_size, seqlen_q, seqlen_k, 1, per_head
         )
 
     return _stack_per_head_startend_row_indices(batch_size, seqlen_q, seqlen_k, h, _per_head)
@@ -421,11 +514,13 @@ def generate_prefix_lm_document_mask_distinct_heads(batch_size, seqlen_q, seqlen
     Per-head distinct prefix-LM document mask via rotating (prefix_length, seq_length) segments per head.
     Output shape: [b, h, seqlen_k, 2]
     """
+    base_doc_seqlens = _default_doc_seqlens_prefix_pairs(seqlen_k) if doc_seqlens is None else list(doc_seqlens)
+
     def _per_head(head_idx: int):
-        if doc_seqlens is None:
-            return generate_prefix_lm_document_mask(batch_size, seqlen_q, seqlen_k, 1, None)
+        per_head = _rotate_list(list(base_doc_seqlens), head_idx)
+        per_head = _perturb_doc_seqlens_prefix_pairs(per_head, head_idx=head_idx, seqlen_k=seqlen_k)
         return generate_prefix_lm_document_mask(
-            batch_size, seqlen_q, seqlen_k, 1, _rotate_list(list(doc_seqlens), head_idx)
+            batch_size, seqlen_q, seqlen_k, 1, per_head
         )
 
     return _stack_per_head_startend_row_indices(batch_size, seqlen_q, seqlen_k, h, _per_head)
