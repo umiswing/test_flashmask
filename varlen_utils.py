@@ -65,6 +65,21 @@ def convert_to_varlen(
     k_varlen = k.reshape([b * skv, hkv, d])
     v_varlen = v.reshape([b * skv, hkv, dv])
 
+    # ── Detect simulated causal masks ──────────────────────────────────
+    # A causal document mask can be encoded as causal=False with bound_num=2
+    # (LTS + UTE) where UTE[j] = min(j, LTS[j]) reproduces the causal
+    # diagonal.  For true non-causal masks, UTE is constant within each
+    # document (= document start), which differs from min(j, LTS[j]).
+    varlen_causal = causal
+    bound_num = startend_row_indices.shape[-1]
+    if not causal and bound_num == 2:
+        lts_all = startend_row_indices[:, 0, :, 0]  # (b, skv)
+        ute_all = startend_row_indices[:, 0, :, 1]  # (b, skv)
+        arange_ref = paddle.arange(skv, dtype=paddle.int32).unsqueeze(0)  # (1, skv)
+        expected_causal_ute = paddle.minimum(arange_ref, lts_all)  # (b, skv)
+        if paddle.equal_all(ute_all, expected_causal_ute).item():
+            varlen_causal = True
+
     result = {
         "q": q_varlen,
         "k": k_varlen,
@@ -73,7 +88,7 @@ def convert_to_varlen(
         "cu_seqlens_k": cu_seqlens,
         "max_seqlen_q": max_doc_len,
         "max_seqlen_k": max_doc_len,
-        "causal": causal,
+        "causal": varlen_causal,
     }
 
     # For non-causal masks with trailing padding: padding rows attend to
