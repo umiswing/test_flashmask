@@ -76,10 +76,11 @@ def generate_causal_document_mask(batch_size, seqlen_q, seqlen_k, h, doc_seqlens
     assert total_seqlen <= seqlen_k
     assert len(doc_seqlens) >= 3
     padding = seqlen_k - np.sum(doc_seqlens)
-    doc_seqlens[-1] += padding
     seq_cusums = np.cumsum(doc_seqlens)
 
     startend_row_indices = np.repeat(seq_cusums, doc_seqlens)
+    padding_mask = np.repeat(seq_cusums[-1], padding)
+    startend_row_indices = np.concatenate([startend_row_indices, padding_mask])
     startend_row_indices = paddle.to_tensor(startend_row_indices, dtype=paddle.int32).reshape((1, 1, seqlen_k, 1)).repeat_interleave(batch_size, 0)
     startend_row_indices = paddle.clip(startend_row_indices, max=seqlen_q)
     
@@ -379,10 +380,11 @@ def generate_causal_document_mask_diff_batch(batch_size, seqlen_q, seqlen_k, h, 
         assert total_seqlen <= seqlen_k
         assert len(doc_seqlens) >= 3
         padding = seqlen_k - np.sum(doc_seqlens)
-        doc_seqlens[-1] += padding
         seq_cusums = np.cumsum(doc_seqlens)
 
         sri = np.repeat(seq_cusums, doc_seqlens)
+        padding_mask = np.repeat(seq_cusums[-1], padding)
+        sri = np.concatenate([sri, padding_mask])
         batch_indices.append(sri)
 
     stacked = np.stack(batch_indices, axis=0)  # (batch_size, seqlen_k)
@@ -446,3 +448,34 @@ def generate_document_mask_diff_batch(batch_size, seqlen_q, seqlen_k, h, doc_seq
 
     causal = False
     return startend_row_indices, causal
+
+def generate_document_mask_simu(batch_size, seqlen_q, seqlen_k, h, doc_seqlens=None):
+    assert seqlen_q == seqlen_k
+    lts, causal = generate_causal_document_mask(batch_size, seqlen_q, seqlen_k, h, doc_seqlens)
+    causal = False
+
+    b, h, s, _ = lts.shape
+    ute = paddle.arange(
+        0, s, 1, dtype="int32"
+    ).reshape((1, 1, s, 1)).repeat_interleave(b, 0).repeat_interleave(h, 1)
+
+    ute = paddle.where(ute <= lts, ute, lts)
+    startend_row_indices = paddle.concat([lts, ute], axis=-1)
+
+    return startend_row_indices, causal
+
+def generate_document_mask_diff_batch_simu(batch_size, seqlen_q, seqlen_k, h, doc_seqlens_list=None):
+    assert seqlen_q == seqlen_k
+    lts, causal = generate_causal_document_mask_diff_batch(batch_size, seqlen_q, seqlen_k, h, doc_seqlens_list)
+    causal = False
+
+    b, h, s, _ = lts.shape
+    ute = paddle.arange(
+        0, s, 1, dtype="int32"
+    ).reshape((1, 1, s, 1)).repeat_interleave(b, 0).repeat_interleave(h, 1)
+
+    ute = paddle.where(ute <= lts, ute, lts)
+    startend_row_indices = paddle.concat([lts, ute], axis=-1)
+
+    return startend_row_indices, causal
+
