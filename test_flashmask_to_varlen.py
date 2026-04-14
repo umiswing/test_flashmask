@@ -39,6 +39,8 @@ from varlen_utils import convert_to_varlen
 from generate_startend_row_indices import (
     generate_causal_document_mask,
     generate_document_mask,
+    generate_causal_document_mask_diff_batch,
+    generate_document_mask_diff_batch,
 )
 
 from test_util import attention_ref
@@ -101,6 +103,8 @@ def generate_shapes():
 mask_generators = [
     partial(generate_document_mask),                # document
     partial(generate_causal_document_mask),                # causal document
+    partial(generate_document_mask_diff_batch),                # document
+    partial(generate_causal_document_mask_diff_batch),                # causal document
 ]
 
 

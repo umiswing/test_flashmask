@@ -344,3 +344,105 @@ def generate_random_eviction_mask(batch_size, seqlen_q, seqlen_k, h, start_row=N
     startend_row_indices = paddle.clip(startend_row_indices, max=seqlen_q)
     causal = True
     return startend_row_indices, causal
+
+
+def _scale_doc_seqlens(doc_seqlens, seqlen_k):
+    """Scale doc_seqlens from base 8192 to target seqlen_k."""
+    if seqlen_k != 8192:
+        doc_seqlens = [int(d * (seqlen_k / 8192)) for d in doc_seqlens]
+    return doc_seqlens
+
+
+# Pre-defined document-length distributions for per-batch variation.
+_DIFF_BATCH_DOC_SEQLENS = [
+    [2538, 1742, 3213],
+    [1500, 3500, 2493],
+    [3000, 1000, 3493],
+    [800, 2200, 4493],
+]
+
+
+def generate_causal_document_mask_diff_batch(batch_size, seqlen_q, seqlen_k, h, doc_seqlens_list=None):
+    """Causal document mask where each batch item has DIFFERENT document boundaries."""
+    if doc_seqlens_list is None:
+        doc_seqlens_list = [
+            _scale_doc_seqlens(_DIFF_BATCH_DOC_SEQLENS[i % len(_DIFF_BATCH_DOC_SEQLENS)], seqlen_k)
+            for i in range(batch_size)
+        ]
+        if seqlen_k != 8192:
+            print(f"{seqlen_k=}, auto setting per-batch doc_seqlens to {doc_seqlens_list}")
+
+    batch_indices = []
+    for bi in range(batch_size):
+        doc_seqlens = list(doc_seqlens_list[bi])
+        total_seqlen = np.sum(doc_seqlens)
+        assert total_seqlen <= seqlen_k
+        assert len(doc_seqlens) >= 3
+        padding = seqlen_k - np.sum(doc_seqlens)
+        doc_seqlens[-1] += padding
+        seq_cusums = np.cumsum(doc_seqlens)
+
+        sri = np.repeat(seq_cusums, doc_seqlens)
+        batch_indices.append(sri)
+
+    stacked = np.stack(batch_indices, axis=0)  # (batch_size, seqlen_k)
+    startend_row_indices = paddle.to_tensor(stacked, dtype=paddle.int32).reshape(
+        (batch_size, 1, seqlen_k, 1)
+    )
+    startend_row_indices = paddle.clip(startend_row_indices, max=seqlen_q)
+
+    causal = True
+    return startend_row_indices, causal
+
+
+def generate_document_mask_diff_batch(batch_size, seqlen_q, seqlen_k, h, doc_seqlens_list=None):
+    """Non-causal document mask where each batch item has DIFFERENT document boundaries."""
+    if doc_seqlens_list is None:
+        doc_seqlens_list = [
+            _scale_doc_seqlens(_DIFF_BATCH_DOC_SEQLENS[i % len(_DIFF_BATCH_DOC_SEQLENS)], seqlen_k)
+            for i in range(batch_size)
+        ]
+        if seqlen_k != 8192:
+            print(f"{seqlen_k=}, auto setting per-batch doc_seqlens to {doc_seqlens_list}")
+
+    batch_down_left = []
+    batch_up_right = []
+    for bi in range(batch_size):
+        doc_seqlens = list(doc_seqlens_list[bi])
+        total_seqlen = np.sum(doc_seqlens)
+        assert total_seqlen <= seqlen_k
+        assert len(doc_seqlens) >= 3
+        padding = seqlen_k - np.sum(doc_seqlens)
+
+        down_left_row_indices = []
+        up_right_row_indices = []
+
+        cur_len_so_far = doc_seqlens[0]
+        for i in range(len(doc_seqlens)):
+            down_left_row_indices.extend([cur_len_so_far] * doc_seqlens[i])
+            if i < len(doc_seqlens) - 1:
+                cur_len_so_far += doc_seqlens[i + 1]
+        if padding > 0:
+            down_left_row_indices.extend([cur_len_so_far] * padding)
+
+        cur_len_so_far = 0
+        for i in range(len(doc_seqlens)):
+            up_right_row_indices.extend([cur_len_so_far] * doc_seqlens[i])
+            if i < len(doc_seqlens) - 1:
+                cur_len_so_far += doc_seqlens[i]
+        if padding > 0:
+            up_right_row_indices.extend([cur_len_so_far] * padding)
+
+        batch_down_left.append(down_left_row_indices)
+        batch_up_right.append(up_right_row_indices)
+
+    down_left = np.array(batch_down_left)  # (batch_size, seqlen_k)
+    up_right = np.array(batch_up_right)    # (batch_size, seqlen_k)
+
+    down_left = paddle.to_tensor(down_left, dtype=paddle.int32).reshape((batch_size, 1, seqlen_k, 1))
+    up_right = paddle.to_tensor(up_right, dtype=paddle.int32).reshape((batch_size, 1, seqlen_k, 1))
+    startend_row_indices = paddle.concat([down_left, up_right], axis=-1)
+    startend_row_indices = paddle.clip(startend_row_indices, max=seqlen_q)
+
+    causal = False
+    return startend_row_indices, causal
