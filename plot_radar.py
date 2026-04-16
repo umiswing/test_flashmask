@@ -162,15 +162,22 @@ def main(methods: list = ["flashmaskv1", "flashmaskv3"]):
     # for kernel in ["fwd", "bwd", "total", "fwd_time", "bwd_time", "total_time", "sparsity"]:
     for kernel in ["fwd", "bwd", "total"]:
         for dtype in ['bf16']:
-            for headdim in [64, 128, 256]:
+            for headdim in [64, 128, 192, 256]:
+                headdim_v = 128 if headdim == 192 else headdim
                 categories = {}
                 for seqlen in [8192, 32768, 131072]:
                     method_to_df = {}
                     for method in methods:
-                        filenames = glob.glob(f'{root_dir}/{dtype}/{method}_*{seqlen}_*_{headdim}*.csv')
+                        filenames = glob.glob(f'{root_dir}/{dtype}/{method}_*{seqlen}_*_{headdim}_{headdim_v}*.csv')
                         dataframes = []
                         for file_path in filenames:
                             df = read_tsv_to_dataframe(file_path)
+                            df.columns = df.columns.str.strip()
+                            # d=192, dv=128: fa4_mask_mod only supports Full & Causal
+                            # (mask_mod is not None is not supported), so truncate all
+                            # methods to the first 2 rows to keep labels aligned.
+                            if headdim == 192 and any(m.startswith('fa4_mask_mod') for m in methods):
+                                df = df[:2]
                             if df is not None:
                                 dataframes.append(df)
 
@@ -257,7 +264,6 @@ def main(methods: list = ["flashmaskv1", "flashmaskv3"]):
 if __name__ == "__main__":
     from jsonargparse import ArgumentParser
     parser = ArgumentParser(description="Run specific examples or all examples.")
-
     parser.add_argument(
         "--methods",
         type=str,
