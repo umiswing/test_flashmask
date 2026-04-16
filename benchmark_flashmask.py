@@ -9,6 +9,8 @@ try:
     from flash_mask.cute.interface import flashmask_attention
 except (ImportError, ModuleNotFoundError):
     from paddle.nn.functional.flash_attention import flashmask_attention
+
+from flash_mask import flashmask_attention as flashmask_attention_interface
 import random
 import os
 from datetime import datetime
@@ -204,6 +206,68 @@ def test_mask(
     fwd_tflops = cal_tflops(fwd_flops, fwd_time_ms)
     bwd_tflops = cal_tflops(bwd_flops, bwd_time_ms)
     total_tflops = cal_tflops(total_flops, total_time_ms)
+
+    return fwd_time_ms, bwd_time_ms, total_time_ms, fwd_flops, bwd_flops, total_flops, fwd_tflops, bwd_tflops, total_tflops, sparsity
+
+def test_mask_varlen(
+    generate_mask_fn,
+    B,
+    S,
+    SKV,
+    H,
+    HKV,
+    D,
+    dtype = 'bf16',
+):
+    if dtype == 'bf16':
+        data_type = paddle.bfloat16
+    else:
+        data_type = paddle.float16
+
+    query = paddle.randn([B, S, H, D], dtype=data_type)
+    key = paddle.randn([B, SKV, HKV, D], dtype=data_type)
+    value = paddle.randn([B, SKV, HKV, D], dtype=data_type)
+    gradOut = paddle.randn([B, S, H, D], dtype=data_type)
+
+    query.stop_gradient = False
+    key.stop_gradient = False
+    value.stop_gradient = False
+
+    startend_row_indices, causal = None, True
+    if generate_mask_fn is not None:
+        startend_row_indices, causal = generate_mask_fn(B, SKV, HKV, D)
+
+    sparsity = flashmask_block_sparsity(causal, startend_row_indices, B, H, HKV, S, SKV)
+    density = 1.0 - sparsity
+
+    def fwd_bwd():
+        q = query.detach().clone()
+        k = key.detach().clone()
+        v = value.detach().clone()
+        q.stop_gradient = False
+        k.stop_gradient = False
+        v.stop_gradient = False
+        out, lse = flashmask_attention_interface(
+            q, k, v,
+            startend_row_indices=startend_row_indices,
+            causal=causal,
+            return_softmax_lse=True,
+            use_varlen=True,
+        )
+        out.backward(gradOut, retain_graph=True)
+
+    total_time_ms = do_bench(fwd_bwd)
+
+    total_flops = density * cal_flops(B, H, S, SKV, D, mode='fwd_bwd')
+    total_tflops = cal_tflops(total_flops, total_time_ms)
+
+    # Return format consistent with test_mask; fwd/bwd individual values are N/A
+    fwd_time_ms = float('nan')
+    bwd_time_ms = float('nan')
+    fwd_flops = float('nan')
+    bwd_flops = float('nan')
+    fwd_tflops = float('nan')
+    bwd_tflops = float('nan')
 
     return fwd_time_ms, bwd_time_ms, total_time_ms, fwd_flops, bwd_flops, total_flops, fwd_tflops, bwd_tflops, total_tflops, sparsity
 
@@ -797,6 +861,10 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
                     # Note(umiswing): support load mask and hybrid mask like this, and also, support simulate cp benchmark
                     # "Dumped Mask": lambda: test_mask(generate_mask_fn=partial(load_mask, path=mask_path, causal=False, cp_size=cp_size, cp_rank=cp_rank), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
                     # "Hybrid SWA": lambda: test_mask(generate_mask_fn=partial(load_mask, path=mask_path, causal=False, cp_size=cp_size, cp_rank=cp_rank, hybrid_mask_fn=partial(hybrid_swa, window_size=512, swa_ratio=0.75)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+
+                    # Varlen benchmarks (fwd+bwd combined, use_varlen=True)
+                    "Varlen Causal Document Mask": lambda: test_mask_varlen(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Varlen Document Mask": lambda: test_mask_varlen(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
                 }
 
                 if "all" in examples:
