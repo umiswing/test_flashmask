@@ -217,8 +217,9 @@ def print_results_table(results: list[dict], machine_info: dict | None = None):
         paddle_version = machine_info.get('paddle_version', 'N/A')
         print(f"  Machine: {gpu} | Paddle {paddle_version}")
     print(f"{'=' * width}")
-    print(f"  {'op':':<18s} {'mode':':<7s} {'B':>4s} {'T':>6s} {'H':>4s} {'D':>4s} {'median(ms)':>12s} {'p20(ms)':>12s} {'p80(ms)':>12s}")
+    print(f"  {'op':<18s} {'mode':<7s} {'B':>4s} {'T':>6s} {'H':>4s} {'D':>4s} {'median(ms)':>12s} {'p20(ms)':>12s} {'p80(ms)':>12s}")
     print(f"  {'-' * 18} {'-' * 7} {'-' * 4} {'-' * 6} {'-' * 4} {'-' * 4} {'-' * 12} {'-' * 12} {'-' * 12}")
+
     for result in results:
         print(
             f"  {result['op']:<18s} {result['mode']:<7s} {result['B']:>4d} {result['T']:>6d} "
