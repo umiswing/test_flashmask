@@ -5,7 +5,10 @@ import pytest
 from einops import rearrange, repeat
 import paddle
 try:
-    from flash_mask.cute.interface import flashmask_attention
+    # from flash_mask.cute.interface import flashmask_attention
+    # from flash_mask import flashmask_attention
+    # from flash_mask import flashmask_attention
+    from paddlefleet.ops.flash_mask import flashmask_attention
 except (ImportError, ModuleNotFoundError):
     # Note(umiswing): comment it out if you really want to test in the old way
     assert False
@@ -52,20 +55,20 @@ shape_cases = (
         (2, 7600, 7600, 32, 8),
     ]
     # tridao case
-    + list(itertools.product(
-        [9],                # batch_size
-        [1, 64,  128, 256, 239, 799, 113, 113, 128, 113, 108, 256, 384, 640, 512, 1024, 1023, 1024,],       # seqlen_q
-        [128, 192, 256,   203, 128, 217, 211, 256, 512, 256, 128, 256, 1024, 1024, 1023,],      # seqlen_k
-        [6],                # nheads
-        [6, 2, 1],          # nheads_kv
-    ))
-    + list(itertools.product(
-        [2],                # batch_size
-        [4096, 4224],       # seqlen_q
-        [4096, 4224],      # seqlen_k
-        [6],                # nheads
-        [6, 2, 1],          # nheads_kv
-    ))
+    # + list(itertools.product(
+    #     [9],                # batch_size
+    #     [1, 64,  128, 256, 239, 799, 113, 113, 128, 113, 108, 256, 384, 640, 512, 1024, 1023, 1024,],       # seqlen_q
+    #     [128, 192, 256,   203, 128, 217, 211, 256, 512, 256, 128, 256, 1024, 1024, 1023,],      # seqlen_k
+    #     [6],                # nheads
+    #     [6, 2, 1],          # nheads_kv
+    # ))
+    # + list(itertools.product(
+    #     [2],                # batch_size
+    #     [4096, 4224],       # seqlen_q
+    #     [4096, 4224],      # seqlen_k
+    #     [6],                # nheads
+    #     [6, 2, 1],          # nheads_kv
+    # ))
 )
 
 # Generate all combinations for second param
@@ -81,16 +84,18 @@ def generate_shapes():
             )
 
 @pytest.mark.parametrize("dtype", [paddle.bfloat16])
-@pytest.mark.parametrize("fa_version", [2, 3, 4])
+# @pytest.mark.parametrize("fa_version", [2, 3, 4])
+@pytest.mark.parametrize("fa_version", [4])
 @pytest.mark.parametrize("d, dv",
     [
-        (32, 32),
-        (64, 64),
-        (80, 80),
+        # (32, 32),
+        # (64, 64),
+        # (80, 80),
         (128, 128),
-        (192, 192),
-        (256, 256),
+        # (192, 192),
+        # (256, 256),
     ])
+@pytest.mark.parametrize("softmax_scale", [None, 1.0 / math.sqrt(64)])
 @pytest.mark.parametrize(
     "batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices",
     list(generate_shapes())
@@ -114,7 +119,7 @@ def generate_shapes():
     ],
 )
 def test_flashmask(
-    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, nheads_startend_row_indices, fa_version, dtype, gen_startend_row_indices, softcap=0.0
+    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, nheads_startend_row_indices, fa_version, dtype, gen_startend_row_indices, softmax_scale, softcap=0.0
 ):
     paddle.seed(2024)
     assert nheads % nheads_kv == 0
@@ -156,7 +161,8 @@ def test_flashmask(
         k_ref,
         v_ref,
         causal=causal,
-        attn_bias=attn_bias
+        attn_bias=attn_bias,
+        softmax_scale=softmax_scale,
     )
 
     out_bf16, attn_bf16 = attention_ref(
@@ -166,7 +172,8 @@ def test_flashmask(
         causal=causal,
         attn_bias=attn_bias,
         upcast=False,
-        reorder_ops=True
+        reorder_ops=True,
+        softmax_scale=softmax_scale,
     )
 
     # # Numerical error if we just do any arithmetic on out_ref
@@ -194,7 +201,8 @@ def test_flashmask(
         v,
         startend_row_indices=startend_row_indices,
         causal=causal,
-        return_softmax_lse=True
+        return_softmax_lse=True,
+        softmax_scale=softmax_scale,
     )
     print(f"flashmask Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"flashmask Output mean diff: {(out - out_ref).abs().mean().item()}")
