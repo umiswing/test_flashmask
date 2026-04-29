@@ -59,6 +59,7 @@ def attention_ref(
     upcast=True,
     reorder_ops=False,
     intermediate_dtype=None,
+    softmax_scale=None,
 ):
     """
     Arguments:
@@ -119,7 +120,8 @@ def attention_ref(
 
     d = q.shape[-1]
     dv = v.shape[-1]
-    softmax_scale = 1.0 / math.sqrt(d if qv is None else d + dv)
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(d if qv is None else d + dv)
 
     if not reorder_ops:
         scores = paddle.matmul(q * softmax_scale, k, transpose_y=True)
