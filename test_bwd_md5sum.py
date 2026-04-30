@@ -47,7 +47,12 @@ GEN_FUNCTIONS_DICT = {
 }
 
 fa_versions = [4]
-d_dv_combinations = [(64, 64), (80, 80), (128, 128)]
+d_dv_combinations = [
+    (64, 64),
+    (80, 80),
+    (128, 128),
+    (192, 128),
+]
 
 def record_gt(output_file="flashmask_bwd_gt.json"):
     gt_records = {}
@@ -120,7 +125,7 @@ def run_flashmask_backward(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d,
         return_softmax_lse=True
     )
 
-    g = paddle.randn(shape=[batch_size, seqlen_q, nheads, d], dtype=dtype)
+    g = paddle.randn(shape=[batch_size, seqlen_q, nheads, dv], dtype=dtype)
     out.backward(g)
 
     dq_md5 = q.grad._md5sum()

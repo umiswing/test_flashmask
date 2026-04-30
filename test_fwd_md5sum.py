@@ -47,9 +47,14 @@ GEN_FUNCTIONS_DICT = {
 }
 
 fa_versions = [4]
-d_dv_combinations = [(64, 64), (80, 80), (128, 128)]
+d_dv_combinations = [
+    (64, 64),
+    (80, 80),
+    (128, 128),
+    (192, 128),
+]
 
-def record_gt(output_file="flashmask_gt.json"):
+def record_gt(output_file="flashmask_fwd_gt.json"):
     gt_records = {}
     
     param_combinations = generate_all_param_combinations()
@@ -187,7 +192,7 @@ def get_dtype_index(dtype):
 
 gt_records = {}
 try:
-    with open("flashmask_gt.json", 'r') as f:
+    with open("flashmask_fwd_gt.json", 'r') as f:
         gt_records = json.load(f)
 except FileNotFoundError:
     pass
@@ -238,7 +243,7 @@ def test_flashmask_md5(
 
 
 if __name__ == "__main__":
-    if not os.path.exists("flashmask_gt.json"):
+    if not os.path.exists("flashmask_fwd_gt.json"):
         print("Start recording ground truth...")
         record_gt()
     else:

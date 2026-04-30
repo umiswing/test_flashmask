@@ -5,9 +5,9 @@
 #       bash run.sh
 #       bash run.sh single
 # 2. 根据 d/dv拆分测试case，一张卡跑一组d/dv，多卡并行跑
-#    现在有6组d/dv，默认 GPU2-7 跑
+#    现在有7组d/dv，默认 GPU1-7 跑
 #       bash run.sh parallel
-#       GPUS="2 3 4 5 6 7" bash run.sh parallel
+#       GPUS="1 2 3 4 5 6 7" bash run.sh parallel
 # =======================================================
 
 # =========================
@@ -43,13 +43,14 @@ cases=(
   "d64-dv64"
   "d80-dv80"
   "d128-dv128"
+  "d192-dv128"
   "d192-dv192"
   "d256-dv256"
 )
 
 # 默认 GPU（也可以外部覆盖）
 if [ -z "$GPUS" ]; then
-    gpus=(2 3 4 5 6 7)
+    gpus=(1 2 3 4 5 6 7)
 else
     read -ra gpus <<< "$GPUS"
 fi
