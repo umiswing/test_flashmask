@@ -24,9 +24,8 @@ from functools import partial
 import paddle
 
 # ── Paddle: flashmask_attention ──────────────────────────────────────────────
-# from flash_mask import flashmask_attention
-from paddlefleet.ops.flash_mask import flashmask_attention
-# import flash_mask
+from flash_mask import flashmask_attention
+# from paddlefleet.ops.flash_mask import flashmask_attention
 
 # ── Mask generators (Paddle) ────────────────────────────────────────────────
 from generate_startend_row_indices import (
