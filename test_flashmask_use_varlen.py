@@ -1,18 +1,3 @@
-"""
-Test: FlashMask (Paddle) vs flash_attn_varlen_func (PyTorch) via convert_to_varlen.
-
-Workflow:
-  1. Generate q, k, v, causal, startend_row_indices (Paddle tensors, padded layout).
-  2. Call convert_to_varlen() to transform startend_row_indices into varlen format:
-       - q_varlen, k_varlen, v_varlen: concatenated Paddle tensors (total_q, nheads, d)
-       - cu_seqlens_q, cu_seqlens_k: cumulative sequence lengths (Paddle, int32)
-       - max_seqlen_q, max_seqlen_k: maximum sequence lengths (int)
-  3. Call Paddle's flashmask_attention with the original padded input.
-  4. Convert varlen tensors from Paddle to PyTorch, then call PyTorch's
-     flash_attn_varlen_func.
-  5. Compare the two outputs via np.allclose.
-"""
-
 import os
 import glob
 import math
