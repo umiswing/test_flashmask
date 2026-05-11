@@ -58,12 +58,12 @@ def generate_shapes():
 
 # Only test mask types that are compatible with varlen (causal-style masks).
 mask_generators = [
-    partial(generate_document_mask),                # document
+    partial(generate_document_mask),                       # document
     partial(generate_causal_document_mask),                # causal document
-    partial(generate_document_mask_diff_batch),                # document
-    partial(generate_causal_document_mask_diff_batch),                # causal document
-    partial(generate_document_mask_simu),                # simu causal document
-    partial(generate_document_mask_diff_batch_simu),                # simu causal document diff batch
+    partial(generate_document_mask_diff_batch),            # document
+    partial(generate_causal_document_mask_diff_batch),     # causal document
+    partial(generate_document_mask_simu),                  # simu causal document
+    partial(generate_document_mask_diff_batch_simu),       # simu causal document diff batch
 ]
 
 
@@ -72,7 +72,12 @@ mask_generators = [
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("dtype", [paddle.bfloat16])
-@pytest.mark.parametrize("d, dv", [(192, 128), (256, 256)])
+@pytest.mark.parametrize("d, dv", [
+    (64, 64),
+    (128, 128),
+    (192, 128),
+    (256, 256),
+])
 @pytest.mark.parametrize(
     "batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices",
     list(generate_shapes()),
@@ -97,7 +102,17 @@ def test_flashmask_to_varlen(
     after converting startend_row_indices to varlen format via convert_to_varlen().
     """
     paddle.seed(2024)
+
     assert nheads % nheads_kv == 0
+
+    deterministic = paddle.get_flags(["FLAGS_cudnn_deterministic"])[
+        "FLAGS_cudnn_deterministic"
+    ]
+    if deterministic and d == 256:
+        pytest.skip(
+            "flash_attn varlen backward does not support head_dim=256 "
+            "when FLAGS_cudnn_deterministic=1."
+        )
 
     # ── 1. Generate padded Q, K, V (Paddle) ─────────────────────────────────
     q_ref = paddle.randn(shape=[batch_size, seqlen_q, nheads, d], dtype=dtype)
