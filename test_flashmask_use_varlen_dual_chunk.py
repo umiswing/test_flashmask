@@ -164,10 +164,10 @@ def compute_reference_dual_chunk(
 
 # (seqlen, cp_size, doc_seqlens, nheads, nheads_kv)
 dual_chunk_cases = [
-    # # Single document, full sequence
-    # (256, 2, [256], 4, 2),
-    # (512, 2, [512], 4, 2),
-    # (512, 4, [512], 4, 2),
+    # Single document, full sequence
+    (256, 2, [256], 4, 2),
+    (512, 2, [512], 4, 2),
+    (512, 4, [512], 4, 2),
     # Multiple documents
     (256, 2, [128, 128], 4, 2),
     (512, 2, [256, 256], 4, 2),
@@ -177,9 +177,9 @@ dual_chunk_cases = [
     (256, 2, [96, 160], 4, 2),
     (512, 2, [100, 200, 212], 4, 2),
     # Large seqlen cases (exercises HD256 kernel path with d=256)
-    # (8192, 2, [8192], 4, 1),
+    (8192, 2, [8192], 4, 1),
     (8192, 2, [2538, 1742, 3213], 4, 1),
-    # (8192, 4, [8192], 4, 1),
+    (8192, 4, [8192], 4, 1),
     (8192, 4, [2538, 1742, 3213], 4, 1),
 ]
 
