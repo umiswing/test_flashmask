@@ -116,6 +116,7 @@ def generate_document_mask(batch_size, seqlen_q, seqlen_k, h, doc_seqlens=None):
         if i < len(doc_seqlens) -1:
             cur_len_so_far += doc_seqlens[i]
     if padding > 0:
+        cur_len_so_far += doc_seqlens[-1]
         up_right_row_indices.extend([cur_len_so_far] * padding)
     
     down_left_row_indices = paddle.to_tensor(down_left_row_indices, dtype=paddle.int32).reshape((1, 1, seqlen_k, 1)).repeat_interleave(batch_size, 0)
@@ -433,6 +434,7 @@ def generate_document_mask_diff_batch(batch_size, seqlen_q, seqlen_k, h, doc_seq
             if i < len(doc_seqlens) - 1:
                 cur_len_so_far += doc_seqlens[i]
         if padding > 0:
+            cur_len_so_far += doc_seqlens[-1]
             up_right_row_indices.extend([cur_len_so_far] * padding)
 
         batch_down_left.append(down_left_row_indices)
