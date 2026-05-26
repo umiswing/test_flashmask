@@ -52,6 +52,7 @@ d_dv_combinations = [
     (80, 80),
     (128, 128),
     (192, 128),
+    (256, 256),
 ]
 
 def record_gt(output_file="flashmask_fwd_gt.json"):

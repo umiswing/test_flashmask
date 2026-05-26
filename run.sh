@@ -16,6 +16,7 @@
 export FLAGS_alloc_fill_value=255
 export FLAGS_use_system_allocator=1
 export FLAGS_check_cuda_error=1
+# export FLAGS_cudnn_deterministic=1
 
 # =========================
 # 默认：单卡整文件测试

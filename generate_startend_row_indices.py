@@ -326,7 +326,7 @@ def generate_qk_sparse_mask(batch_size, seqlen_q, seqlen_k, h, maskout_pair=None
     return startend_row_indices, causal
 
 def generate_random_eviction_mask(batch_size, seqlen_q, seqlen_k, h, start_row=None):
-    # np.random.seed(0)
+    np.random.seed(0)
     if start_row == None:
         start_row = 4096
         if seqlen_k != 8192:

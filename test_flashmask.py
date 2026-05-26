@@ -134,16 +134,18 @@ def test_flashmask(
     paddle.seed(2024)
     assert nheads % nheads_kv == 0
 
+    flashmask_impl = (fa_version == 3 or fa_version == 4)
+
     startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
 
-    if fa_version == 4 and seqlen_q != seqlen_k and causal and d > 128:
-      pytest.skip(f"Skipping because running fa4 and {d=} > 128 and {seqlen_q=} {seqlen_k} {causal=}")
-
-    if fa_version == 2 and seqlen_q != seqlen_k and causal:
+    if (fa_version == 2 or (d == 192 and dv == 192)) and seqlen_q != seqlen_k and causal:
+      # fa3/fa4 fallback to fa2
       pytest.skip(f"Skipping because running fa2 in causal when seqlen_q != seqlen_k")
 
-    if fa_version == 4 and startend_row_indices is not None and startend_row_indices.shape[-1] == 4:
+    if flashmask_impl and startend_row_indices is not None and startend_row_indices.shape[-1] == 4:
       pytest.skip(f"Skipping because running fa4 when startend_row_indices.shape[-1] == 4")
+
+    use_sink = flashmask_impl and not (d == 192 and dv == 192)
 
     q_ref = paddle.randn(shape=[batch_size, seqlen_q, nheads, d], dtype=dtype)
     k_ref = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, d], dtype=dtype)
@@ -167,12 +169,26 @@ def test_flashmask(
 
     attn_bias = startend_row_indices_to_attn_bias(startend_row_indices, seqlen_q, nheads, dtype, causal)
 
+    if use_sink:
+        sink_ref = paddle.randn(shape=[nheads], dtype=dtype)
+        sink_bf16 = sink_ref.detach().clone()
+        sink = sink_ref.detach().clone()
+
+        sink_bf16.stop_gradient = False
+        sink_ref.stop_gradient = False
+        sink.stop_gradient = False
+    else:
+        sink_ref = None
+        sink_bf16 = None
+        sink = None
+
     out_ref, attn_ref = attention_ref(
         q_ref,
         k_ref,
         v_ref,
         causal=causal,
-        attn_bias=attn_bias
+        attn_bias=attn_bias,
+        learnable_sink=sink_ref,
     )
 
     out_bf16, attn_bf16 = attention_ref(
@@ -182,7 +198,8 @@ def test_flashmask(
         causal=causal,
         attn_bias=attn_bias,
         upcast=False,
-        reorder_ops=True
+        reorder_ops=True,
+        learnable_sink=sink_bf16,
     )
 
     # # Numerical error if we just do any arithmetic on out_ref
@@ -210,7 +227,8 @@ def test_flashmask(
         v,
         startend_row_indices=startend_row_indices,
         causal=causal,
-        return_softmax_lse=True
+        return_softmax_lse=True,
+        learnable_sink=sink,
     )
     print(f"flashmask Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"flashmask Output mean diff: {(out - out_ref).abs().mean().item()}")
@@ -248,3 +266,26 @@ def test_flashmask(
     assert (k.grad - k_ref.grad).abs().max().item() <= rtol * (k_bf16.grad - k_ref.grad).abs().max().item() + dk_atol
     dv_atol = 2 * (v_ref.grad + 0.3 - 0.3 - v_ref.grad).abs().max().item() + (0 if softcap == 0 else 3e-4)
     assert (v.grad - v_ref.grad).abs().max().item() <= rtol * (v_bf16.grad - v_ref.grad).abs().max().item() + dv_atol
+
+    if use_sink:
+        print(f"flashmask dSink max diff: {(sink.grad - sink_ref.grad).abs().max().item()}")
+        print(f"flashmask dSink mean diff: {(sink.grad - sink_ref.grad).abs().mean().item()}")
+        print(f"Paddle naive bf16 dSink max diff: {(sink_bf16.grad - sink_ref.grad).abs().max().item()}")
+        print(f"Paddle naive bf16 dSink mean diff: {(sink_bf16.grad - sink_ref.grad).abs().mean().item()}")
+
+        delta = (out_ref * g).sum(-1)                                      # (b, sq, h)
+        delta = delta.transpose([0, 2, 1])                                 # (b, h, sq)
+        p_sink = 1.0 - attn_ref.sum(-1)
+
+        dsink_ref_analytic = -(p_sink * delta).sum(axis=[0, 2])            # (h,)
+        err_scale = (p_sink * delta.abs()).sum(axis=[0, 2])                # (h,)
+
+        dsink_diff = (sink.grad - sink_ref.grad).abs()
+        dsink_tol = 1e-2 + rtol * 2**-8 * err_scale
+        assert bool((dsink_diff <= dsink_tol).all().item()), (
+            f"dsink mismatch: max_diff={dsink_diff.max().item():.6f}, "
+            f"max_tol={dsink_tol.max().item():.6f}, "
+            f"err_scale_max={err_scale.max().item():.4f}"
+        )
+
+    paddle.device.cuda.empty_cache()

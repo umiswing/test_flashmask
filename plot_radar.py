@@ -103,6 +103,7 @@ def plot_radar(categories, save_path, methods,
                                     fontproperties=font_prop,
                                     bbox=dict(boxstyle="round,pad=0.18", fc="w", ec=color, lw=0.6, alpha=0.85))
 
+
         # draw percentage (when len methods >= 2)
         if show_percent_label and len(methods) >= 2:
             baseline_method = methods[0]
@@ -162,12 +163,13 @@ def main(methods: list = ["flashmaskv1", "flashmaskv3"]):
     # for kernel in ["fwd", "bwd", "total", "fwd_time", "bwd_time", "total_time", "sparsity"]:
     for kernel in ["fwd", "bwd", "total"]:
         for dtype in ['bf16']:
-            for headdim in [64, 128, 256]:
+            for headdim in [64, 128, 192, 256]:
+                headdim_v = 128 if headdim == 192 else headdim
                 categories = {}
-                for seqlen in [8192, 32768, 131072]:
+                for seqlen in [4096, 8192, 32768, 131072]:
                     method_to_df = {}
                     for method in methods:
-                        filenames = glob.glob(f'{root_dir}/{dtype}/{method}_*{seqlen}_*_{headdim}*.csv')
+                        filenames = glob.glob(f'{root_dir}/{dtype}/{method}_*{seqlen}_*_{headdim}_{headdim_v}*.csv')
                         dataframes = []
                         for file_path in filenames:
                             df = read_tsv_to_dataframe(file_path)
