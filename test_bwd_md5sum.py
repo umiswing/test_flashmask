@@ -25,7 +25,6 @@ from generate_startend_row_indices import (
     generate_qk_sparse_mask,
     generate_random_eviction_mask
 )
-from test_util import attention_ref
 try:
     from flash_mask.cute.interface import flashmask_attention
 except (ImportError, ModuleNotFoundError):
@@ -52,6 +51,7 @@ d_dv_combinations = [
     (80, 80),
     (128, 128),
     (192, 128),
+    (256, 256),
 ]
 
 def record_gt(output_file="flashmask_bwd_gt.json"):

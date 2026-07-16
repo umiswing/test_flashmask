@@ -60,6 +60,7 @@ def attention_ref(
     reorder_ops=False,
     intermediate_dtype=None,
     softmax_scale=None,
+    learnable_sink=None,
 ):
     """
     Arguments:
@@ -91,6 +92,8 @@ def attention_ref(
         v = paddle.cast(v, paddle.float32)
         if qv is not None:
             qv = paddle.cast(qv, paddle.float32)
+        if learnable_sink is not None:
+            learnable_sink = paddle.cast(learnable_sink, paddle.float32)
 
     if q_descale is not None:
         assert False
@@ -174,7 +177,15 @@ def attention_ref(
         all_inf_mask = (attn_bias == -np.inf).all(axis=-1, keepdim=True)
         scores = paddle.where(all_inf_mask, paddle.full_like(scores, -1e9), scores)
 
-    attention = paddle.nn.functional.softmax(scores, axis=-1).cast(v.dtype)
+    if learnable_sink is not None:
+        sink = learnable_sink.reshape([1, -1, 1, 1]).cast(scores.dtype).expand(
+            [scores.shape[0], -1, scores.shape[2], -1]
+        )
+        scores = paddle.concat([scores, sink], axis=-1)
+        attention_full = paddle.nn.functional.softmax(scores, axis=-1)  # fp32
+        attention = attention_full[..., :-1].cast(v.dtype)
+    else:
+        attention = paddle.nn.functional.softmax(scores, axis=-1).cast(v.dtype)
 
     if attn_bias is not None:
         # when all values in a line of attn_bias are -inf, we setting value in this line to a very small value

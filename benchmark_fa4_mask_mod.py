@@ -3,6 +3,7 @@ import numpy as np
 from functools import lru_cache
 from typing import Optional, List
 import random
+import gc
 
 import torch
 
@@ -108,10 +109,15 @@ def compute_density_sparsity(flex_mask_mod, causal, B, H, M, N, tile_m, tile_n, 
 def calculate_tflops(flops: float, time_ms: float, multiplier: int) -> float:
     return multiplier * flops * (1e3 / time_ms) / 1e12
 
-def cal_flops(B, H, Sq, Sk, D, mode='fwd'):
+def cal_flops(B, H, Sq, Sk, D, DV, mode='fwd'):
     assert mode in ["fwd", "bwd", "fwd_bwd"]
-    f = 4 * B * Sq * Sk * H * D
-    return f if mode == "fwd" else (2.5 * f if mode == "bwd" else 3.5 * f)
+    if mode == "fwd":
+        f = 2 * B * Sq * Sk * H * (D + DV)
+    elif mode == "bwd":
+        f = 2 * B * Sq * Sk * H * (3 * D + 2 * DV)
+    else:
+        f = 2 * B * Sq * Sk * H * (4 * D + 3 * DV)
+    return f
 
 def cal_tflops(flops, time_ms):
     return  flops * (1e3 / time_ms) / 1e12
@@ -183,6 +189,8 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flu
     for _ in range(n_warmup):
         fn()
     # Benchmark
+    gc.collect()
+    gc.disable()
     for i in range(n_repeat):
         if grad_to_none is not None:
             for x in grad_to_none:
@@ -191,6 +199,7 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flu
         start_event[i].record()
         fn()
         end_event[i].record()
+    gc.enable()
     torch.cuda.synchronize()
     times = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float32)
     return _summarize_statistics(times, quantiles, return_mode)
@@ -208,6 +217,7 @@ def test_mask(
     HKV,
     S,
     D,
+    DV,
     dtype,
     skip_correctness: bool = False,
     print_mask: bool = True,
@@ -257,14 +267,15 @@ def test_mask(
         tile_n=tile_n
     )
 
-    q, out, gradOut = [
-        torch.randn(B, S, H, D, device=device, dtype=data_type, requires_grad=True)
-        for _ in range(3)
-    ]
-    k, v = [
-        torch.randn(B, S, HKV, D, device=device, dtype=data_type, requires_grad=True)
+    q = torch.randn(B, S, H, D, device=device, dtype=data_type, requires_grad=True)
+    k = torch.randn(B, S, HKV, D, device=device, dtype=data_type, requires_grad=True)
+    v = torch.randn(B, S, HKV, DV, device=device, dtype=data_type, requires_grad=True)
+
+    out, gradOut = [
+        torch.randn(B, S, H, DV, device=device, dtype=data_type, requires_grad=True)
         for _ in range(2)
     ]
+
     lse = torch.empty(B, H, S, device=device, dtype=torch.float32)
 
     fa4_mask_mod_call = lambda: _flash_attn_fwd(
@@ -287,7 +298,7 @@ def test_mask(
     # torch.cuda.nvtx.range_pop()
     torch._functorch.config.donated_buffer=False
     # Backward pass
-    out_cute, lse_cute = fa4_mask_mod_call()
+    out_cute, lse_cute, _, _ = fa4_mask_mod_call()
 
     fa4_mask_mod_bwd_call = lambda: _flash_attn_bwd(
         q=q,
@@ -313,9 +324,9 @@ def test_mask(
 
     total_time_ms = fwd_time_ms + bwd_time_ms
 
-    fwd_flops = density * cal_flops(B, H, S, S, D, mode='fwd')
-    bwd_flops = density * cal_flops(B, H, S, S, D, mode='bwd')
-    total_flops = density * cal_flops(B, H, S, S, D, mode='fwd_bwd')
+    fwd_flops = density * cal_flops(B, H, S, S, D, DV, mode='fwd')
+    bwd_flops = density * cal_flops(B, H, S, S, D, DV,  mode='bwd')
+    total_flops = density * cal_flops(B, H, S, S, D, DV,  mode='fwd_bwd')
 
     fwd_tflops = cal_tflops(fwd_flops, fwd_time_ms)
     bwd_tflops = cal_tflops(bwd_flops, bwd_time_ms)
@@ -846,15 +857,21 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
         #doc_seq_lens_list = doc_seq_lens_list[::-1]
         # Note(umiswing): fa4 does not support d 256
         for D in [128]:
-            H = 4096 // D
+            if D == 192:
+                DV = 128
+                H = 16
+            else:
+                DV = D
+                H = 4096 // D
             HKV = H
+    
             for idx, (S, prefix_doc_seq_lens, qksparse_mask) in enumerate(doc_seq_lens_list):
                 B = 128 * 1024 // S
 
                 doc_seq_lens = [x[1] for x in prefix_doc_seq_lens]
                 maskout_pair = []
                 offset = 0
-                print(f"{B}_{S}_{H}_{D}_{idx}_{dtype}")
+                print(f"{B}_{S}_{H}_{D}_{DV}_{idx}_{dtype}")
                 if sum(qksparse_mask) == 0:
                     maskout_pair = [(1024, 538), (2358, 1700)]
                 else:
@@ -866,20 +883,20 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
                 share_qa_docs = [split_sequence(doc_seq) for doc_seq in doc_seq_lens]
 
                 available_examples = {
-                    "Full": lambda: test_mask(mask_info={"cute_mask_mod": None, "flex_mask_mod": None, "aux_tensors": None, "causal": False}, B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Causal": lambda: test_mask(mask_info={"cute_mask_mod": None, "flex_mask_mod": None, "aux_tensors": None, "causal": True}, B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Sliding Window": lambda: test_mask(mask_info=generate_sliding_window(window_size=int(S*0.0625)), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Causal Document Mask": lambda: test_mask(mask_info=generate_causal_document_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Full": lambda: test_mask(mask_info={"cute_mask_mod": None, "flex_mask_mod": None, "aux_tensors": None, "causal": False}, B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
+                    "Causal": lambda: test_mask(mask_info={"cute_mask_mod": None, "flex_mask_mod": None, "aux_tensors": None, "causal": True}, B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
+                    "Sliding Window": lambda: test_mask(mask_info=generate_sliding_window(window_size=int(S*0.0625)), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
+                    "Causal Document Mask": lambda: test_mask(mask_info=generate_causal_document_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
                     # Note(umiswing): FA4 mask_mod will hang in Document Mask, and idk why
-                    # "Document Mask": lambda: test_mask(mask_info=generate_document_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Share Question Mask": lambda: test_mask(mask_info=generate_share_question_mask(doc_seq_lens=share_qa_docs, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Global Sliding Window": lambda: test_mask(mask_info=generate_global_sliding_window_mask(global_token=16, B=B, S=S, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Causal Blockwise Mask": lambda: test_mask(mask_info=generate_causal_blockwise_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Prefix LM Document Mask": lambda: test_mask(mask_info=generate_prefix_lm_document_mask(doc_seq_lens=prefix_doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Prefix LM Causal Mask": lambda: test_mask(mask_info=generate_prefix_lm_causal_mask(prefix_length=int(S*0.5), B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "QK-sparse Mask": lambda: test_mask(mask_info=generate_qk_sparse_mask(maskout_pair=maskout_pair, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Random Eviction Mask": lambda: test_mask(mask_info=generate_random_eviction_mask(start_row=S//2, B=B, S=S, H=H, HKV=HKV), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    # "Hybrid SWA Prefix LM Doc": lambda: test_mask(mask_info=generate_hybrid_swa_prefix_lm_document_mask(batch_size=B, seqlen=S, hkv=H, d=D, doc_seq_lens=prefix_doc_seq_lens), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    # "Document Mask": lambda: test_mask(mask_info=generate_document_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
+                    "Share Question Mask": lambda: test_mask(mask_info=generate_share_question_mask(doc_seq_lens=share_qa_docs, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
+                    "Global Sliding Window": lambda: test_mask(mask_info=generate_global_sliding_window_mask(global_token=16, B=B, S=S, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
+                    "Causal Blockwise Mask": lambda: test_mask(mask_info=generate_causal_blockwise_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
+                    "Prefix LM Document Mask": lambda: test_mask(mask_info=generate_prefix_lm_document_mask(doc_seq_lens=prefix_doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
+                    "Prefix LM Causal Mask": lambda: test_mask(mask_info=generate_prefix_lm_causal_mask(prefix_length=int(S*0.5), B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
+                    "QK-sparse Mask": lambda: test_mask(mask_info=generate_qk_sparse_mask(maskout_pair=maskout_pair, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
+                    "Random Eviction Mask": lambda: test_mask(mask_info=generate_random_eviction_mask(start_row=S//2, B=B, S=S, H=H, HKV=HKV), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
+                    # "Hybrid SWA Prefix LM Doc": lambda: test_mask(mask_info=generate_hybrid_swa_prefix_lm_document_mask(batch_size=B, seqlen=S, hkv=H, d=D, doc_seq_lens=prefix_doc_seq_lens), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
                 }
 
                 if "all" in examples:
@@ -919,7 +936,7 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
                 )
                 content2=tabulate(results, headers=headers, tablefmt="tsv")
                 os.makedirs(f"{dtype}", exist_ok=True)
-                text_file = open(f"{dtype}/fa4_mask_mod_{current_time}_{B}_{S}_{H}_{HKV}_{D}_{idx}.csv","w")
+                text_file = open(f"{dtype}/fa4_mask_mod_{current_time}_{B}_{S}_{H}_{HKV}_{D}_{DV}_{idx}.csv","w")
                 text_file.write(content2)
                 text_file.close()
 
