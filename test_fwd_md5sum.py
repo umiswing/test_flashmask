@@ -55,7 +55,15 @@ d_dv_combinations = [
     (256, 256),
 ]
 
-def record_gt(output_file="flashmask_fwd_gt.json"):
+def get_gt_filename(base="flashmask_fwd_gt"):
+    # Tag the ground truth file with the fa version(s) so fa3 and fa4 ground
+    # truth can coexist, e.g. flashmask_fwd_gt_fa3.json / flashmask_fwd_gt_fa4.json.
+    version_tag = "_".join(str(v) for v in fa_versions)
+    return f"{base}_fa{version_tag}.json"
+
+GT_FILE = get_gt_filename()
+
+def record_gt(output_file=GT_FILE):
     gt_records = {}
     
     param_combinations = generate_all_param_combinations()
@@ -193,7 +201,7 @@ def get_dtype_index(dtype):
 
 gt_records = {}
 try:
-    with open("flashmask_fwd_gt.json", 'r') as f:
+    with open(GT_FILE, 'r') as f:
         gt_records = json.load(f)
 except FileNotFoundError:
     pass
@@ -244,7 +252,7 @@ def test_flashmask_md5(
 
 
 if __name__ == "__main__":
-    if not os.path.exists("flashmask_fwd_gt.json"):
+    if not os.path.exists(GT_FILE):
         print("Start recording ground truth...")
         record_gt()
     else:

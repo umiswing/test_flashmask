@@ -131,19 +131,22 @@ def generate_shapes():
 def test_flashmask(
     batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, nheads_startend_row_indices, fa_version, dtype, gen_startend_row_indices, softcap=0.0
 ):
-    paddle.seed(2024)
+    paddle.seed(2026)
     assert nheads % nheads_kv == 0
 
     flashmask_impl = (fa_version == 3 or fa_version == 4)
 
     startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
 
-    if (fa_version == 2 or (d == 192 and dv == 192)) and seqlen_q != seqlen_k and causal:
-      # fa3/fa4 fallback to fa2
-      pytest.skip(f"Skipping because running fa2 in causal when seqlen_q != seqlen_k")
+    if (batch_size, seqlen_q, seqlen_k, nheads, nheads_kv) == (2, 7600, 7600, 32, 8) and fa_version == 3:
+        pytest.skip("Skipping (2,7600,7600,32,8) on fa3 due to OOM")
 
-    if flashmask_impl and startend_row_indices is not None and startend_row_indices.shape[-1] == 4:
-      pytest.skip(f"Skipping because running fa4 when startend_row_indices.shape[-1] == 4")
+    if (fa_version == 2 or (d == 192 and dv == 192)) and seqlen_q != seqlen_k and causal:
+        # fa3/fa4 fallback to fa2
+        pytest.skip(f"Skipping because running fa2 in causal when seqlen_q != seqlen_k")
+
+    if fa_version == 4 and startend_row_indices is not None and startend_row_indices.shape[-1] == 4:
+        pytest.skip(f"Skipping because running fa4 when startend_row_indices.shape[-1] == 4")
 
     use_sink = flashmask_impl and not (d == 192 and dv == 192)
 
