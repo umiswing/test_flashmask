@@ -25,7 +25,7 @@ from generate_startend_row_indices import (
     generate_qk_sparse_mask,
     generate_random_eviction_mask
 )
-from test_util import attention_ref
+from test_util import attention_ref, detect_fa_versions
 try:
     from flash_mask.cute.interface import flashmask_attention
 except (ImportError, ModuleNotFoundError):
@@ -46,7 +46,7 @@ GEN_FUNCTIONS_DICT = {
     "random_eviction": partial(generate_random_eviction_mask),
 }
 
-fa_versions = [4]
+fa_versions = detect_fa_versions()
 d_dv_combinations = [
     (64, 64),
     (80, 80),

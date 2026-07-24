@@ -5,10 +5,6 @@ from typing import Optional, List
 from tabulate import tabulate
 import time
 import paddle
-try:
-    from flash_mask.cute.interface import flashmask_attention
-except (ImportError, ModuleNotFoundError):
-    from paddle.nn.functional.flash_attention import flashmask_attention
 import random
 import os
 import gc
@@ -129,7 +125,7 @@ def test_mask(
     DV,
     dtype = 'bf16',
     use_sink = False,
-    backend = 'cpp',
+    backend = 'cutedsl',
 ):
 
     if dtype == 'bf16':
@@ -160,11 +156,12 @@ def test_mask(
 
     flashmask = lambda: flashmask_attention(query, key, value, startend_row_indices=startend_row_indices, causal=causal, return_softmax_lse=True)
 
-    fa_version = paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"]
+    use_cutedsl = (backend == 'cutedsl')
 
-    # fa4 always runs on the cutedsl path; for fa3 the backend is switchable
-    # between the paddle C++ kernel ("cpp") and the cutedsl kernel ("cutedsl").
-    use_cutedsl = (fa_version == 4) or (backend == 'cutedsl')
+    if use_cutedsl:
+        from flash_mask.cute.interface import flashmask_attention
+    else:
+        from paddle.nn.functional.flash_attention import flashmask_attention
 
     if use_cutedsl:
         query.stop_gradient = True
@@ -749,7 +746,7 @@ def split_sequence(sequence_length):
 
     return lengths
 
-def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_base", overwrite=True, head_dim=None, current_time=None, backend='cpp'):
+def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_base", overwrite=True, head_dim=None, current_time=None, backend='cutedsl'):
     """Run the benchmark with the given examples.
 
     Args:
@@ -760,10 +757,16 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
 
     if backend not in ('cpp', 'cutedsl'):
         raise ValueError(f"backend must be 'cpp' or 'cutedsl', but got {backend}")
-    # The cpp/cutedsl switch is only meaningful for fa3. fa1/fa2 only have the
-    # cpp kernel, and fa4 always runs on cutedsl.
-    if backend == 'cutedsl' and fm_version != 3:
-        raise ValueError(f"backend switching to 'cutedsl' is only allowed for fa3 (fm_version=3), but got fm_version={fm_version}")
+    if backend == 'cpp' and fm_version == 4:
+        raise ValueError(
+            f"backend 'cpp' is not supported for fa4 (fm_version=4), "
+            f"please use 'cutedsl' instead"
+        )
+    if backend == 'cutedsl' and fm_version not in (3, 4):
+        raise ValueError(
+            f"backend switching to 'cutedsl' is only allowed for fa3/fa4 "
+            f"(fm_version=3 or 4), but got fm_version={fm_version}"
+        )
 
     if fm_version == 1:
         paddle.set_flags({'FLAGS_flash_attn_version': 2})
@@ -928,7 +931,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backend",
         type=str,
-        default="cpp",
+        default="cutedsl",
         choices=["cpp", "cutedsl"],
         help="Kernel backend to benchmark. Only switchable for fa3 (fm_version=3): "
         "'cpp' uses the paddle C++ flashmask kernel, 'cutedsl' uses the cutedsl kernel.",

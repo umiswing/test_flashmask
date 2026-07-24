@@ -27,7 +27,7 @@ from generate_startend_row_indices import (
   generate_empty_mask,
 )
 from functools import partial
-from test_util import attention_ref
+from test_util import attention_ref, detect_fa_versions
 
 # batch_size, seqlen_q, seqlen_k, nheads, nheads_kv
 shape_cases = (
@@ -87,6 +87,8 @@ d_dv_cases = [
     (256, 256),
 ]
 
+fa_versions = detect_fa_versions()
+
 # Generate all combinations for second param
 def generate_shapes():
     for batch_size, seqlen_q, seqlen_k, nheads, nheads_kv in shape_cases:
@@ -100,7 +102,7 @@ def generate_shapes():
             )
 
 @pytest.mark.parametrize("dtype", [paddle.bfloat16])
-@pytest.mark.parametrize("fa_version", [2, 3, 4])
+@pytest.mark.parametrize("fa_version", fa_versions)
 @pytest.mark.parametrize(
     "d, dv",
     d_dv_cases,

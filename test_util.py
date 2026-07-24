@@ -5,6 +5,24 @@ from einops import rearrange, repeat
 
 import numpy as np
 
+def detect_fa_versions():
+    # Auto-select fa version by GPU arch:
+    #   Hopper   (H-series, sm90)          -> fa3
+    #   Blackwell(B-series, sm100)         -> fa4
+    #   other                              -> fa2
+    try:
+        major = paddle.device.cuda.get_device_capability()[0]
+        if major >= 10:
+            versions = [4]
+        elif major >= 9:
+            versions = [3]
+        else:
+            versions = [2]
+    except Exception:
+        versions = [2]
+    print(f"[detect_fa_versions] auto-detected fa_versions={versions}")
+    return versions
+
 def construct_local_mask(
     seqlen_q,
     seqlen_k,
