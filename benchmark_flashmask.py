@@ -5,10 +5,6 @@ from typing import Optional, List
 from tabulate import tabulate
 import time
 import paddle
-try:
-    from flash_mask.cute.interface import flashmask_attention
-except (ImportError, ModuleNotFoundError):
-    from paddle.nn.functional.flash_attention import flashmask_attention
 import random
 import os
 import gc
@@ -129,6 +125,7 @@ def test_mask(
     DV,
     dtype = 'bf16',
     use_sink = False,
+    backend = 'cutedsl',
 ):
 
     if dtype == 'bf16':
@@ -159,9 +156,14 @@ def test_mask(
 
     flashmask = lambda: flashmask_attention(query, key, value, startend_row_indices=startend_row_indices, causal=causal, return_softmax_lse=True)
 
-    fa_version = paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"]
+    use_cutedsl = (backend == 'cutedsl')
 
-    if fa_version == 4:
+    if use_cutedsl:
+        from flash_mask.cute.interface import flashmask_attention
+    else:
+        from paddle.nn.functional.flash_attention import flashmask_attention
+
+    if use_cutedsl:
         query.stop_gradient = True
         key.stop_gradient = True
         value.stop_gradient = True
@@ -186,7 +188,7 @@ def test_mask(
 
     flashmask_out, lse = flashmask()
 
-    if fa_version == 4:
+    if use_cutedsl:
         def flashmask_bwd():
             from flash_mask.cute import flashmask_utils as fm
             from flash_mask.cute.interface import _flash_attn_bwd
@@ -744,7 +746,7 @@ def split_sequence(sequence_length):
 
     return lengths
 
-def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_base", overwrite=True, head_dim=None, current_time=None):
+def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_base", overwrite=True, head_dim=None, current_time=None, backend='cutedsl'):
     """Run the benchmark with the given examples.
 
     Args:
@@ -752,6 +754,19 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
     """
     if current_time is None:
         current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    if backend not in ('cpp', 'cutedsl'):
+        raise ValueError(f"backend must be 'cpp' or 'cutedsl', but got {backend}")
+    if backend == 'cpp' and fm_version == 4:
+        raise ValueError(
+            f"backend 'cpp' is not supported for fa4 (fm_version=4), "
+            f"please use 'cutedsl' instead"
+        )
+    if backend == 'cutedsl' and fm_version not in (3, 4):
+        raise ValueError(
+            f"backend switching to 'cutedsl' is only allowed for fa3/fa4 "
+            f"(fm_version=3 or 4), but got fm_version={fm_version}"
+        )
 
     if fm_version == 1:
         paddle.set_flags({'FLAGS_flash_attn_version': 2})
@@ -812,23 +827,26 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
 
                 share_qa_docs = [split_sequence(doc_seq) for doc_seq in doc_seq_lens]
                 available_examples = {
-                    "Full": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=False), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Causal": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=True), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_sliding_window_mask, window_size=int(S*0.0625)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Causal Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Share Question Mask": lambda: test_mask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    # "Global Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Causal Blockwise Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_blockwise_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Prefix LM Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Prefix LM Causal Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_causal_mask, prefix_length=int(S*0.5)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "QK-sparse Mask": lambda: test_mask(generate_mask_fn=partial(generate_qk_sparse_mask, maskout_pair=maskout_pair), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Random Eviction Mask": lambda: test_mask(generate_mask_fn=partial(generate_random_eviction_mask, start_row=S//2), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    # "Hybrid SWA Prefix LM Doc": lambda: test_mask(generate_mask_fn=partial(generate_hybrid_swa_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
+                    "Full": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=False), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
+                    "Causal": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=True), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
+                    "Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_sliding_window_mask, window_size=int(S*0.0625)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
+                    "Causal Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
+                    "Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
+                    "Share Question Mask": lambda: test_mask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
+                    "Causal Blockwise Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_blockwise_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
+                    "Prefix LM Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
+                    "Prefix LM Causal Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_causal_mask, prefix_length=int(S*0.5)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
+                    "QK-sparse Mask": lambda: test_mask(generate_mask_fn=partial(generate_qk_sparse_mask, maskout_pair=maskout_pair), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
+                    "Random Eviction Mask": lambda: test_mask(generate_mask_fn=partial(generate_random_eviction_mask, start_row=S//2), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
+                    # "Hybrid SWA Prefix LM Doc": lambda: test_mask(generate_mask_fn=partial(generate_hybrid_swa_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
                     # Note(umiswing): support load mask and hybrid mask like this, and also, support simulate cp benchmark
-                    # "Dumped Mask": lambda: test_mask(generate_mask_fn=partial(load_mask, path=mask_path, causal=False, cp_size=cp_size, cp_rank=cp_rank), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    # "Hybrid SWA": lambda: test_mask(generate_mask_fn=partial(load_mask, path=mask_path, causal=False, cp_size=cp_size, cp_rank=cp_rank, hybrid_mask_fn=partial(hybrid_swa, window_size=512, swa_ratio=0.75)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
+                    # "Dumped Mask": lambda: test_mask(generate_mask_fn=partial(load_mask, path=mask_path, causal=False, cp_size=cp_size, cp_rank=cp_rank), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
+                    # "Hybrid SWA": lambda: test_mask(generate_mask_fn=partial(load_mask, path=mask_path, causal=False, cp_size=cp_size, cp_rank=cp_rank, hybrid_mask_fn=partial(hybrid_swa, window_size=512, swa_ratio=0.75)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
                 }
+
+                # Global Sliding Window is enabled for fa3, but disabled for fa4.
+                if fm_version == 3:
+                    available_examples["Global Sliding Window"] = lambda: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend)
 
 
                 if "all" in examples:
@@ -909,6 +927,14 @@ if __name__ == "__main__":
         "--current_time",
         type=str,
         default=None
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="cutedsl",
+        choices=["cpp", "cutedsl"],
+        help="Kernel backend to benchmark. Only switchable for fa3 (fm_version=3): "
+        "'cpp' uses the paddle C++ flashmask kernel, 'cutedsl' uses the cutedsl kernel.",
     )
 
     group = parser.add_mutually_exclusive_group()

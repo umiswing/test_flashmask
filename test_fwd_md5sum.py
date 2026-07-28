@@ -25,7 +25,7 @@ from generate_startend_row_indices import (
     generate_qk_sparse_mask,
     generate_random_eviction_mask
 )
-from test_util import attention_ref
+from test_util import attention_ref, detect_fa_versions
 try:
     from flash_mask.cute.interface import flashmask_attention
 except (ImportError, ModuleNotFoundError):
@@ -46,7 +46,7 @@ GEN_FUNCTIONS_DICT = {
     "random_eviction": partial(generate_random_eviction_mask),
 }
 
-fa_versions = [4]
+fa_versions = detect_fa_versions()
 d_dv_combinations = [
     (64, 64),
     (80, 80),
@@ -55,7 +55,15 @@ d_dv_combinations = [
     (256, 256),
 ]
 
-def record_gt(output_file="flashmask_fwd_gt.json"):
+def get_gt_filename(base="flashmask_fwd_gt"):
+    # Tag the ground truth file with the fa version(s) so fa3 and fa4 ground
+    # truth can coexist, e.g. flashmask_fwd_gt_fa3.json / flashmask_fwd_gt_fa4.json.
+    version_tag = "_".join(str(v) for v in fa_versions)
+    return f"{base}_fa{version_tag}.json"
+
+GT_FILE = get_gt_filename()
+
+def record_gt(output_file=GT_FILE):
     gt_records = {}
     
     param_combinations = generate_all_param_combinations()
@@ -193,7 +201,7 @@ def get_dtype_index(dtype):
 
 gt_records = {}
 try:
-    with open("flashmask_fwd_gt.json", 'r') as f:
+    with open(GT_FILE, 'r') as f:
         gt_records = json.load(f)
 except FileNotFoundError:
     pass
@@ -244,7 +252,7 @@ def test_flashmask_md5(
 
 
 if __name__ == "__main__":
-    if not os.path.exists("flashmask_fwd_gt.json"):
+    if not os.path.exists(GT_FILE):
         print("Start recording ground truth...")
         record_gt()
     else:
