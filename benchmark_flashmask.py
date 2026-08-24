@@ -36,6 +36,28 @@ def cal_flops(B, H, Sq, Sk, D, DV, mode='fwd'):
 def cal_tflops(flops, time_ms):
     return  flops * (1e3 / time_ms) / 1e12
 
+# KV shared: k and v are ONE buffer (the MLA convention, v = k[..., :dv]) and the
+# SM100 big-headdim backward merges dK and dV into a single accumulator. Only these
+# (D, DV) pairs are implemented
+KV_SHARED_D_DV = ((512, 512), (576, 512))
+
+
+def kv_shared_detected(k, v):
+    """Whether the backward will take its kv-shared path for these two tensors.
+    """
+    try:
+        same_storage = k.data_ptr() == v.data_ptr()
+    except (AttributeError, RuntimeError):
+        return False
+    return (
+        same_storage
+        and k.dtype == v.dtype
+        and list(k.shape[:-1]) == list(v.shape[:-1])
+        and v.shape[-1] <= k.shape[-1]
+        and tuple(k.strides[:-1]) == tuple(v.strides[:-1])
+    )
+
+
 def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean"):
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
@@ -126,6 +148,7 @@ def test_mask(
     dtype = 'bf16',
     use_sink = False,
     backend = 'cutedsl',
+    kv_mode = 'split',
 ):
 
     if dtype == 'bf16':
@@ -135,16 +158,34 @@ def test_mask(
 
     query = paddle.randn([B, S, H, D], dtype=data_type)
     key = paddle.randn([B, SKV, HKV, D], dtype=data_type)
-    value = paddle.randn([B, SKV, HKV, DV], dtype=data_type)
-    gradOut = paddle.randn([B, S, H, DV], dtype=data_type)
-
     query.stop_gradient = False
     key.stop_gradient = False
-    value.stop_gradient = False
+    if kv_mode == 'shared':
+        # The MLA call convention: one D-wide latent buffer is K, and V is its
+        # leading DV columns as a stride-1 view. That aliasing is what the
+        # backward detects to merge dK and dV into one accumulator. The view is
+        # taken after stop_gradient is cleared so K stays the only leaf.
+        value = key[..., :DV]
+    else:
+        value = paddle.randn([B, SKV, HKV, DV], dtype=data_type)
+        value.stop_gradient = False
+    assert kv_shared_detected(key, value) == (kv_mode == 'shared'), (
+        f"kv_mode={kv_mode!r} but the kernel would detect "
+        f"kv_shared={kv_shared_detected(key, value)}"
+    )
+    gradOut = paddle.randn([B, S, H, DV], dtype=data_type)
 
-    startend_row_indices, causal = None, True
-    if generate_mask_fn is not None:
-        startend_row_indices, causal = generate_mask_fn(B, SKV, HKV, D)
+    # startend_row_indices is a given (the layer already has it) and flashmask
+    # consumes it as-is, so there is no mask-conversion step to report here.
+    # Building it below is test-data setup, not a cost the kernel imposes. The
+    # competitor benchmarks time exactly the step this path does not have:
+    # startend_row_indices -> the mask their kernel needs.
+    def build_mask():
+        if generate_mask_fn is None:
+            return None, True
+        return generate_mask_fn(B, SKV, HKV, D)
+
+    startend_row_indices, causal = build_mask()
 
     sparsity = flashmask_block_sparsity(causal, startend_row_indices, B, H, HKV, S, SKV)
     density = 1.0 - sparsity
@@ -167,6 +208,9 @@ def test_mask(
         query.stop_gradient = True
         key.stop_gradient = True
         value.stop_gradient = True
+        if sink is not None:
+            # Same leak, and this one hits kv_mode='split' too.
+            sink.stop_gradient = True
         def flashmask_fwd():
             from flash_mask.cute.interface import _flash_attn_fwd
             out, lse = _flash_attn_fwd(
@@ -385,6 +429,7 @@ def generate_causal_document_mask(B, S, H, D, doc_seq_lens=[2538, 1742, 3213]):
     
     causal = True
     return startend_row_indices, causal
+
 
 def generate_document_mask(B, S, H, D, doc_seq_lens=[2538, 1742, 3213]):
     total_seq_len = np.sum(doc_seq_lens)
@@ -746,12 +791,72 @@ def split_sequence(sequence_length):
 
     return lengths
 
-def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_base", overwrite=True, head_dim=None, current_time=None, backend='cutedsl'):
+def method_name(fm_version, kv_mode):
+    """CSV / plot_radar method prefix for a (version, kv_mode) pair.
+
+    'shared' gets a suffix WITHOUT a separating underscore because plot_radar.py
+    globs '{method}_*': 'flashmaskv4_kvshared_...' would also match method
+    'flashmaskv4' and silently average the two modes together.
+    """
+    return f"flashmaskv{fm_version}" + ("kvshared" if kv_mode == "shared" else "")
+
+
+def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="", overwrite=True, head_dim=None, current_time=None, backend='cutedsl', kv_mode=None, use_sink=False, vs_sparse_attn=False, dedup_static_masks=False):
     """Run the benchmark with the given examples.
 
     Args:
         examples: List of examples to run. If "all" is specified, all examples will be run.
+        kv_mode: 'split' keeps K and V in separate buffers (the default, and the
+            only option below head_dim 512). 'shared' passes V as a stride-1 view
+            onto K, which is what makes the SM100 big-headdim backward merge dK
+            and dV into one accumulator. 'sweep' measures both. 'shared' is
+            silently dropped for every (D, DV) outside KV_SHARED_D_DV: without
+            the merge it is the split kernel with an aliased V, so it would burn
+            a second full run to reproduce the 'split' number.
+        use_sink: add the learnable per-head attention sink. The online latent-MQA
+            layers carry one when ``add_full_attention_sink_bias`` is set and run
+            sinkless otherwise, so both are worth measuring.
+        vs_sparse_attn: restrict the run to what benchmark_flashmla_sparse_attn.py
+            can be compared against. It only emits the ``Causal`` and ``Causal
+            Document Mask`` operations, and plot_radar drops any row not shared by
+            every method, so the other masks would be measured and then thrown
+            away. It also pins the shapes to that kernel's constraints
+            (H=64, HKV=1, d_v=512, kv_mode='shared'); an explicit --head_dim or
+            --kv_mode still wins.
+        dedup_static_masks: skip the masks that only depend on S (S_ONLY_EXAMPLES)
+            on every sample but the first of each ``Total length`` block. Those
+            masks are identical across the 5 samples, so the extra 4 runs measure
+            the same kernel again. Applies under vs_sparse_attn as well, where it
+            leaves ``Causal`` on the first sample and ``Causal Document Mask`` on
+            all five.
+
+    Sequence lengths and document layouts come from kernel_test_seq_info.txt --
+    every ``Total length`` block, every sample. Add a case by adding a line
+    there; nothing here is parameterised by seqlen.
     """
+    # Operations benchmark_flashmla_sparse_attn.py also produces (its `layouts`
+    # dict). Keep in sync with that file.
+    VS_SPARSE_EXAMPLES = ("Causal", "Causal Document Mask")
+
+    # These masks are a function of S alone (Full/Causal, or a window / prefix /
+    # start row derived from S), so the 5 samples inside one "Total length" block
+    # of kernel_test_seq_info.txt all produce the identical mask. With
+    # --dedup_static_masks they are measured on the first sample of each block only.
+    # This applies under --vs_sparse_attn too: Causal is S-only there as well, so
+    # only Causal Document Mask is left on the later samples. plot_radar averages
+    # the samples of one seqlen by Operation name, so a row present in one sample
+    # file and absent from the others is handled.
+    S_ONLY_EXAMPLES = ("Full", "Causal", "Sliding Window",
+                       "Prefix LM Causal Mask", "Random Eviction Mask")
+
+    if kv_mode is None:
+        # The competitor's K and V are one single-head latent buffer, so 'shared'
+        # is the layout that lines up with it.
+        kv_mode = 'shared' if vs_sparse_attn else 'split'
+    if kv_mode not in ('split', 'shared', 'sweep'):
+        raise ValueError(f"kv_mode must be 'split', 'shared' or 'sweep', but got {kv_mode}")
+    kv_modes = ['split', 'shared'] if kv_mode == 'sweep' else [kv_mode]
+
     if current_time is None:
         current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
 
@@ -777,9 +882,23 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
     else:
         raise ArgumentError(f"fm_version must be 1 or 3 or 4, but got {fm_version}")
 
-    d_list = [128, 192, 256] if fm_version == 4 else [64, 128, 256]
+    d_list = [128, 192, 256, 512] if fm_version == 4 else [64, 128, 256]
     if head_dim is not None:
         d_list = [head_dim]
+
+    if vs_sparse_attn:
+        if head_dim is None:
+            d_list = [576]
+        elif head_dim not in (512, 576):
+            # Mirror benchmark_flashmla_sparse_attn.py's unsupported_reason(): that
+            # kernel only runs (D, DV) in ((512, 512), (576, 512)), so nothing else
+            # can be put next to it -- and those are also the only pairs with a
+            # kv-shared backward.
+            raise ValueError(
+                f"--vs_sparse_attn cannot measure head_dim={head_dim}: "
+                f"benchmark_flashmla_sparse_attn.py only runs {KV_SHARED_D_DV} "
+                "(see its unsupported_reason). Drop --head_dim or pass 512 / 576."
+            )
 
     total_length = 0
     doc_seq_lens_list = []
@@ -795,17 +914,48 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
                 qksparse_mask = eval(line.split(":")[-1].split("#")[1].strip())
                 doc_seq_lens_list.append((total_length, doc_list, qksparse_mask))
         #doc_seq_lens_list = doc_seq_lens_list[::-1]
+        # The first sample of each "Total length" block: the one entry per S that
+        # still measures the S_ONLY_EXAMPLES under --dedup_static_masks.
+        first_idx_of_S = {}
+        for i, (s, _, _) in enumerate(doc_seq_lens_list):
+            first_idx_of_S.setdefault(s, i)
         for D in d_list:
             if D == 192:
                 DV = 128
                 H = 16
+            elif D == 576:
+                DV = 512
+                H = 8
             else:
                 DV = D
                 H = 4096 // D
-            HKV = H
+
+            if vs_sparse_attn:
+                H = 64
+                HKV = 1
+            else:    
+                HKV = H
+
+            # kv_mode='shared' only means something where the backward actually
+            # merges dK and dV; anywhere else it is the split kernel with an
+            # aliased V, i.e. a duplicate of the 'split' number for twice the
+            # wall clock. Decide once per D instead of re-testing per sample.
+            if (D, DV) in KV_SHARED_D_DV:
+                d_kv_modes = kv_modes
+            else:
+                d_kv_modes = [m for m in kv_modes if m != 'shared']
+                if 'shared' in kv_modes:
+                    print(f"D={D} DV={DV}: skipping kv_mode=shared, the dK/dV "
+                          f"merge is only implemented for {KV_SHARED_D_DV} so it "
+                          f"would just repeat the 'split' measurement.")
+                if not d_kv_modes:
+                    continue
 
             for idx, (S, prefix_doc_seq_lens, qksparse_mask) in enumerate(doc_seq_lens_list):
-                B = 128 * 1024 // S
+                if vs_sparse_attn:
+                    B = 1
+                else:
+                    B = 128 * 1024 // S
 
                 SQ = S
                 SKV = S
@@ -814,8 +964,12 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
                 offset = 0
                 print(f"{B}_{S}_{H}_{HKV}_{D}_{DV}_{idx}_{dtype}")
                 if not overwrite:
-                    if os.path.exists(f"{dtype}{suffix}/flashmaskv{fm_version}_{B}_{S}_{H}_{D}_{DV}_{idx}.csv"):
-                        print(f"{dtype}{suffix}/flashmaskv{fm_version}_{B}_{S}_{H}_{D}_{DV}_{idx}.csv already exists, skipping. To enable overwrite, use: --overwrite (True by default).")
+                    done = [
+                        os.path.exists(f"{dtype}{suffix}/{method_name(fm_version, m)}_{B}_{S}_{H}_{D}_{DV}_{idx}.csv")
+                        for m in d_kv_modes
+                    ]
+                    if all(done):
+                        print(f"{dtype}{suffix}/*_{B}_{S}_{H}_{D}_{DV}_{idx}.csv already exists for kv_mode={d_kv_modes}, skipping. To enable overwrite, use: --overwrite (True by default).")
                         continue
                 if sum(qksparse_mask) == 0:
                     maskout_pair = [(1024, 538), (2358, 1700)]
@@ -826,27 +980,29 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
                         offset += doc_seq
 
                 share_qa_docs = [split_sequence(doc_seq) for doc_seq in doc_seq_lens]
+                # Every entry takes kv_mode ('split' | 'shared') so the same mask
+                # can be measured with K and V separate or aliased into one buffer.
                 available_examples = {
-                    "Full": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=False), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
-                    "Causal": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=True), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
-                    "Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_sliding_window_mask, window_size=int(S*0.0625)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
-                    "Causal Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
-                    "Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
-                    "Share Question Mask": lambda: test_mask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
-                    "Causal Blockwise Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_blockwise_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
-                    "Prefix LM Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
-                    "Prefix LM Causal Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_causal_mask, prefix_length=int(S*0.5)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
-                    "QK-sparse Mask": lambda: test_mask(generate_mask_fn=partial(generate_qk_sparse_mask, maskout_pair=maskout_pair), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
-                    "Random Eviction Mask": lambda: test_mask(generate_mask_fn=partial(generate_random_eviction_mask, start_row=S//2), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
-                    # "Hybrid SWA Prefix LM Doc": lambda: test_mask(generate_mask_fn=partial(generate_hybrid_swa_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
+                    "Full": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_none_mask, causal=False), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
+                    "Causal": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_none_mask, causal=True), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
+                    "Sliding Window": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_sliding_window_mask, window_size=int(S*0.0625)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
+                    "Causal Document Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
+                    "Document Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
+                    "Share Question Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
+                    "Causal Blockwise Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_causal_blockwise_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
+                    "Prefix LM Document Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
+                    "Prefix LM Causal Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_prefix_lm_causal_mask, prefix_length=int(S*0.5)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
+                    "QK-sparse Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_qk_sparse_mask, maskout_pair=maskout_pair), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
+                    "Random Eviction Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_random_eviction_mask, start_row=S//2), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
+                    # "Hybrid SWA Prefix LM Doc": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_hybrid_swa_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
                     # Note(umiswing): support load mask and hybrid mask like this, and also, support simulate cp benchmark
-                    # "Dumped Mask": lambda: test_mask(generate_mask_fn=partial(load_mask, path=mask_path, causal=False, cp_size=cp_size, cp_rank=cp_rank), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
-                    # "Hybrid SWA": lambda: test_mask(generate_mask_fn=partial(load_mask, path=mask_path, causal=False, cp_size=cp_size, cp_rank=cp_rank, hybrid_mask_fn=partial(hybrid_swa, window_size=512, swa_ratio=0.75)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend),
+                    # "Dumped Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(load_mask, path=mask_path, causal=False, cp_size=cp_size, cp_rank=cp_rank), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
+                    # "Hybrid SWA": lambda kv_mode: test_mask(generate_mask_fn=partial(load_mask, path=mask_path, causal=False, cp_size=cp_size, cp_rank=cp_rank, hybrid_mask_fn=partial(hybrid_swa, window_size=512, swa_ratio=0.75)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
                 }
 
                 # Global Sliding Window is enabled for fa3, but disabled for fa4.
                 if fm_version == 3:
-                    available_examples["Global Sliding Window"] = lambda: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend)
+                    available_examples["Global Sliding Window"] = lambda kv_mode: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode)
 
 
                 if "all" in examples:
@@ -854,42 +1010,64 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
                 else:
                     ex_to_run = examples
 
-                results = []
-                for ex in ex_to_run:
-                    if ex in available_examples:
-                        print(ex)
-                        fw_time, bw_time, total_time, fw_flops, bw_flops, total_flops, fw_tflops, bw_tflops, total_tflops, sparsity = available_examples[ex]()
-                        results.append([ex, f"{fw_time:.4f}", f"{bw_time:.4f}", f"{total_time:.4f}", f"{fw_flops:.4f}", f"{bw_flops:.4f}", f"{total_flops:.4f}", f"{fw_tflops:.4f}", f"{bw_tflops:.4f}", f"{total_tflops:4f}", f"{sparsity:.4f}"])
-                    else:
-                        print(f"Warning: Unknown example key '{ex}'. Skipping.")
+                if dedup_static_masks and idx != first_idx_of_S[S]:
+                    ex_to_run = [ex for ex in ex_to_run if ex not in S_ONLY_EXAMPLES]
 
-                # Usage in your results formatting:
-                headers = [
-                    "Operation",
-                    "FW Time (ms)",
-                    "BW Time (ms)",
-                    "TOTAL Time (ms)",
-                    "FW FLOPs",
-                    "BW FLOPs",
-                    "TOTAL FLOPs",
-                    "FW TFLOPs/s",
-                    "BW TFLOPs/s",
-                    "TOTAL TFLOPs/s",
-                    "Sparsity",
-                ]
-                print(
-                    tabulate(
-                        results,
-                        headers=headers,
-                        tablefmt="grid",
+                if vs_sparse_attn:
+                    dropped = [ex for ex in ex_to_run if ex not in VS_SPARSE_EXAMPLES]
+                    if dropped:
+                        print(f"--vs_sparse_attn: dropping {dropped}, "
+                              f"benchmark_flashmla_sparse_attn.py only emits "
+                              f"{list(VS_SPARSE_EXAMPLES)} and plot_radar keeps "
+                              f"only the operations every method shares.")
+                    ex_to_run = [ex for ex in ex_to_run if ex in VS_SPARSE_EXAMPLES]
+
+                if not ex_to_run:
+                    print("Nothing left to measure for this sample after the "
+                          "--dedup_static_masks / --vs_sparse_attn filters, skipping.")
+                    continue
+
+                for mode in d_kv_modes:
+                    results = []
+                    for ex in ex_to_run:
+                        if ex in available_examples:
+                            print(f"{ex} [kv_mode={mode}]")
+                            fw_time, bw_time, total_time, fw_flops, bw_flops, total_flops, fw_tflops, bw_tflops, total_tflops, sparsity = available_examples[ex](mode)
+                            results.append([ex, f"{fw_time:.4f}", f"{bw_time:.4f}", f"{total_time:.4f}", f"{fw_flops:.4f}", f"{bw_flops:.4f}", f"{total_flops:.4f}", f"{fw_tflops:.4f}", f"{bw_tflops:.4f}", f"{total_tflops:4f}", f"{sparsity:.4f}"])
+                        else:
+                            print(f"Warning: Unknown example key '{ex}'. Skipping.")
+
+                    # Usage in your results formatting:
+                    headers = [
+                        "Operation",
+                        "FW Time (ms)",
+                        "BW Time (ms)",
+                        "TOTAL Time (ms)",
+                        "FW FLOPs",
+                        "BW FLOPs",
+                        "TOTAL FLOPs",
+                        "FW TFLOPs/s",
+                        "BW TFLOPs/s",
+                        "TOTAL TFLOPs/s",
+                        "Sparsity",
+                    ]
+                    print(
+                        tabulate(
+                            results,
+                            headers=headers,
+                            tablefmt="grid",
+                        )
                     )
-                )
-                content2=tabulate(results, headers=headers, tablefmt="tsv")
-                os.makedirs(f"{dtype}{suffix}", exist_ok=True)
-                # Note(umiswing): this file name is better, but i need to keep the old name for fig plotting
-                text_file = open(f"{dtype}{suffix}/flashmaskv{fm_version}_{current_time}_{B}_{S}_{H}_{HKV}_{D}_{DV}_{idx}.csv","w")
-                text_file.write(content2)
-                text_file.close()
+                    content2=tabulate(results, headers=headers, tablefmt="tsv")
+                    os.makedirs(f"{dtype}{suffix}", exist_ok=True)
+                    # Note(umiswing): this file name is better, but i need to keep the old name for fig plotting
+                    # Note: no underscore before "kvshared" on purpose -- plot_radar.py
+                    # globs "{method}_*", so "flashmaskv4_kvshared_..." would also be
+                    # picked up as method "flashmaskv4" and mix the two modes.
+                    method = method_name(fm_version, mode)
+                    text_file = open(f"{dtype}{suffix}/{method}_{current_time}_{B}_{S}_{H}_{HKV}_{D}_{DV}_{idx}.csv","w")
+                    text_file.write(content2)
+                    text_file.close()
 
 if __name__ == "__main__":
     from jsonargparse import ArgumentParser
@@ -937,9 +1115,55 @@ if __name__ == "__main__":
         "'cpp' uses the paddle C++ flashmask kernel, 'cutedsl' uses the cutedsl kernel.",
     )
 
+    parser.add_argument(
+        "--kv_mode",
+        type=str,
+        default=None,
+        choices=["split", "shared", "sweep"],
+        help="KV layout to benchmark. 'split': K and V are separate buffers "
+        "(the default). 'shared': V is a stride-1 view onto K (the MLA "
+        "convention), which lets the SM100 big-headdim backward merge dK and dV "
+        "-- only implemented for (D, DV) in ((512,512),(576,512)). 'sweep': both. "
+        "Left unset, --vs_sparse_attn picks 'shared' and everything else 'split'.",
+    )
+
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--overwrite", action="store_true", default=True)
     group.add_argument("--no-overwrite", action="store_false", dest="overwrite")
+
+    sink_group = parser.add_mutually_exclusive_group()
+    sink_group.add_argument(
+        "--use_sink",
+        action="store_true",
+        default=False,
+        help="Add the learnable per-head attention sink (the online latent-MQA "
+        "layers carry one when add_full_attention_sink_bias is set).",
+    )
+    sink_group.add_argument("--no-use_sink", action="store_false", dest="use_sink")
+
+    parser.add_argument(
+        "--vs_sparse_attn",
+        action="store_true",
+        default=False,
+        help="Only measure what benchmark_flashmla_sparse_attn.py can be "
+        "compared against: the Causal and Causal Document Mask operations, at "
+        "that kernel's shapes (head_dim 576, 64 query heads, 1 KV head, "
+        "kv_mode shared). An explicit --head_dim or --kv_mode still wins. "
+        "Without this flag every mask is measured, as before.",
+    )
+
+    parser.add_argument(
+        "--dedup_static_masks",
+        action="store_true",
+        default=False,
+        help="Skip the masks that only depend on the sequence length (Full, "
+        "Causal, Sliding Window, Prefix LM Causal Mask, Random Eviction Mask) on "
+        "every sample but the first of each 'Total length' block of "
+        "kernel_test_seq_info.txt. Those samples only differ in their document "
+        "layout, so for these masks the extra runs re-measure the same kernel. "
+        "Applies under --vs_sparse_attn too, where only Causal Document Mask is "
+        "then left on the later samples.",
+    )
 
     args = parser.parse_args()
     main(**vars(args))

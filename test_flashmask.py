@@ -77,6 +77,32 @@ print(f"  - Unique Count:   {len(shape_cases)}")
 print(f"  - Removed:        {_shape_cases_before - len(shape_cases)}")
 print(f"{'='*60}")
 
+# KV shared is only implemented for these (d, dv): the backward merges dK and dV
+# into one accumulator, which needs a chunk layout that covers both axes.
+KV_SHARED_D_DV = ((512, 512), (576, 512))
+
+
+def kv_shared_detected(k, v):
+    """Whether the backward will take its kv-shared path for these two tensors.
+
+    Verbatim the predicate in flash_mask/cute/interface.py:1272-1280 minus the
+    (d, dv) gate. Duplicated here so the test can ASSERT which path it exercised:
+    if paddle ever materialises ``k[..., :dv]`` as a copy, the merge would
+    silently not run and the test would pass while covering nothing.
+    """
+    try:
+        same_storage = k.data_ptr() == v.data_ptr()
+    except (AttributeError, RuntimeError):
+        return False
+    return (
+        same_storage
+        and k.dtype == v.dtype
+        and list(k.shape[:-1]) == list(v.shape[:-1])
+        and v.shape[-1] <= k.shape[-1]
+        and tuple(k.strides[:-1]) == tuple(v.strides[:-1])
+    )
+
+
 d_dv_cases = [
     (32, 32),
     (64, 64),
@@ -85,6 +111,8 @@ d_dv_cases = [
     (192, 128),
     (192, 192),
     (256, 256),
+    (512, 512),
+    (576, 512),
 ]
 
 fa_versions = detect_fa_versions()
@@ -103,6 +131,7 @@ def generate_shapes():
 
 @pytest.mark.parametrize("dtype", [paddle.bfloat16])
 @pytest.mark.parametrize("fa_version", fa_versions)
+@pytest.mark.parametrize("kv_mode", ["split", "shared"])
 @pytest.mark.parametrize(
     "d, dv",
     d_dv_cases,
@@ -131,10 +160,20 @@ def generate_shapes():
     ],
 )
 def test_flashmask(
-    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, nheads_startend_row_indices, fa_version, dtype, gen_startend_row_indices, softcap=0.0
+    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, nheads_startend_row_indices, kv_mode, fa_version, dtype, gen_startend_row_indices, softcap=0.0
 ):
     paddle.seed(2026)
     assert nheads % nheads_kv == 0
+
+    # KV shared: k and v are ONE buffer (the MLA convention, v = k[..., :dv]).
+    # Only the fa4 cutedsl big-headdim backward merges dK/dV, and only for the
+    # (d, dv) pairs above -- anywhere else "shared" would just re-run the split
+    # path with a different allocation.
+    kv_shared = kv_mode == "shared"
+    if kv_shared and (d, dv) not in KV_SHARED_D_DV:
+        pytest.skip(f"Skipping kv shared for d{d}-dv{dv}: merge not implemented")
+    if kv_shared and fa_version != 4:
+        pytest.skip("Skipping kv shared on fa2/fa3: no big-headdim cutedsl backward")
 
     flashmask_impl = (fa_version == 3 or fa_version == 4)
 
@@ -154,23 +193,43 @@ def test_flashmask(
 
     q_ref = paddle.randn(shape=[batch_size, seqlen_q, nheads, d], dtype=dtype)
     k_ref = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, d], dtype=dtype)
-    v_ref = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, dv], dtype=dtype)
 
     q_ref.stop_gradient = False
     k_ref.stop_gradient = False
-    v_ref.stop_gradient = False
 
-    q_bf16, k_bf16, v_bf16 = [x.detach().clone() for x in (q_ref, k_ref, v_ref)]
+    def make_qkv(q_src, k_src, v_src):
+        """One (q, k, v) triplet. In shared mode v is a stride-1 view onto k.
 
-    q_bf16.stop_gradient = False
-    k_bf16.stop_gradient = False
-    v_bf16.stop_gradient = False
+        The view is taken AFTER stop_gradient is cleared, so k is the leaf and
+        autograd folds dV back into k.grad the same way the kernel's merged
+        accumulator does.
+        """
+        q = q_src.detach().clone()
+        k = k_src.detach().clone()
+        q.stop_gradient = False
+        k.stop_gradient = False
+        if kv_shared:
+            v = k[..., :dv]
+        else:
+            v = v_src.detach().clone()
+            v.stop_gradient = False
+        return q, k, v
 
-    q, k, v = [x.detach().clone() for x in (q_ref, k_ref, v_ref)]
+    if kv_shared:
+        v_ref = k_ref[..., :dv]
+        assert kv_shared_detected(k_ref, v_ref), (
+            "v is not a stride-1 view onto k -- paddle materialised the slice, "
+            "so the kernel's kv-shared path would not be exercised"
+        )
+    else:
+        v_ref = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, dv], dtype=dtype)
+        v_ref.stop_gradient = False
 
-    q.stop_gradient = False
-    k.stop_gradient = False
-    v.stop_gradient = False
+    q_bf16, k_bf16, v_bf16 = make_qkv(q_ref, k_ref, v_ref)
+    q, k, v = make_qkv(q_ref, k_ref, v_ref)
+
+    if kv_shared:
+        assert kv_shared_detected(k, v)
 
     attn_bias = startend_row_indices_to_attn_bias(startend_row_indices, seqlen_q, nheads, dtype, causal)
 
@@ -253,24 +312,31 @@ def test_flashmask(
 
     print(f"flashmask dQ max diff: {(q.grad - q_ref.grad).abs().max().item()}")
     print(f"flashmask dK max diff: {(k.grad - k_ref.grad).abs().max().item()}")
-    print(f"flashmask dV max diff: {(v.grad - v_ref.grad).abs().max().item()}")
     print(f"flashmask dQ mean diff: {(q.grad - q_ref.grad).abs().mean().item()}")
     print(f"flashmask dK mean diff: {(k.grad - k_ref.grad).abs().mean().item()}")
-    print(f"flashmask dV mean diff: {(v.grad - v_ref.grad).abs().mean().item()}")
 
     print(f"Paddle naive bf16 dQ max diff: {(q_bf16.grad - q_ref.grad).abs().max().item()}")
     print(f"Paddle naive bf16 dK max diff: {(k_bf16.grad - k_ref.grad).abs().max().item()}")
-    print(f"Paddle naive bf16 dV max diff: {(v_bf16.grad - v_ref.grad).abs().max().item()}")
     print(f"Paddle naive bf16 dQ mean diff: {(q_bf16.grad - q_ref.grad).abs().mean().item()}")
     print(f"Paddle naive bf16 dK mean diff: {(k_bf16.grad - k_ref.grad).abs().mean().item()}")
-    print(f"Paddle naive bf16 dV mean diff: {(v_bf16.grad - v_ref.grad).abs().mean().item()}")
+
+    if not kv_shared:
+        print(f"flashmask dV max diff: {(v.grad - v_ref.grad).abs().max().item()}")
+        print(f"flashmask dV mean diff: {(v.grad - v_ref.grad).abs().mean().item()}")
+        print(f"Paddle naive bf16 dV max diff: {(v_bf16.grad - v_ref.grad).abs().max().item()}")
+        print(f"Paddle naive bf16 dV mean diff: {(v_bf16.grad - v_ref.grad).abs().mean().item()}")
 
     dq_atol = 2 * (q_ref.grad + 0.3 - 0.3 - q_ref.grad).abs().max().item() + (0 if softcap == 0 else 3e-4)
     assert (q.grad - q_ref.grad).abs().max().item() <= rtol * (q_bf16.grad - q_ref.grad).abs().max().item() + dq_atol
+    # In shared mode k is the only leaf, so k.grad already carries dK + dV: the
+    # kernel merges them into one accumulator and returns an all-zero dv, and
+    # autograd's slice_grad scatters that zero dv back into the same buffer. The
+    # dK check below is therefore the dKV check; v.grad does not exist.
     dk_atol = 2 * (k_ref.grad + 0.3 - 0.3 - k_ref.grad).abs().max().item() + (0 if softcap == 0 else 3e-4)
     assert (k.grad - k_ref.grad).abs().max().item() <= rtol * (k_bf16.grad - k_ref.grad).abs().max().item() + dk_atol
-    dv_atol = 2 * (v_ref.grad + 0.3 - 0.3 - v_ref.grad).abs().max().item() + (0 if softcap == 0 else 3e-4)
-    assert (v.grad - v_ref.grad).abs().max().item() <= rtol * (v_bf16.grad - v_ref.grad).abs().max().item() + dv_atol
+    if not kv_shared:
+        dv_atol = 2 * (v_ref.grad + 0.3 - 0.3 - v_ref.grad).abs().max().item() + (0 if softcap == 0 else 3e-4)
+        assert (v.grad - v_ref.grad).abs().max().item() <= rtol * (v_bf16.grad - v_ref.grad).abs().max().item() + dv_atol
 
     if use_sink:
         print(f"flashmask dSink max diff: {(sink.grad - sink_ref.grad).abs().max().item()}")
@@ -282,7 +348,6 @@ def test_flashmask(
         delta = delta.transpose([0, 2, 1])                                 # (b, h, sq)
         p_sink = 1.0 - attn_ref.sum(-1)
 
-        dsink_ref_analytic = -(p_sink * delta).sum(axis=[0, 2])            # (h,)
         err_scale = (p_sink * delta.abs()).sum(axis=[0, 2])                # (h,)
 
         dsink_diff = (sink.grad - sink_ref.grad).abs()

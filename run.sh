@@ -47,6 +47,10 @@ cases=(
   "d192-dv128"
   "d192-dv192"
   "d256-dv256"
+#   "d512-dv512-split"
+#   "d512-dv512-shared"
+#   "d576-dv512-split"
+#   "d576-dv512-shared"
 )
 
 # 默认 GPU（也可以外部覆盖）
