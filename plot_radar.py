@@ -11,10 +11,31 @@ warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
 def read_tsv_to_dataframe(file_path):
     try:
         df = pd.read_csv(file_path, sep='\t')
+        # tabulate pads header cells to the widest value in the column, so the
+        # same logical column arrives as 'Operation   ' in one file and
+        # 'Operation      ' in another depending on which mask names that run
+        # emitted. Canonicalise on read: a name resolved from one file's columns
+        # is then a valid key in every other file's dataframe.
+        df.columns = [str(c).strip() for c in df.columns]
         return df
     except Exception as e:
         print(f"An error occurred: {e}")
         return None
+
+METHOD_LABELS = {
+    'old_flashmaskv3': 'FlashMask V3 B.O.',
+    'flashmaskv3': 'FlashMask V3',
+    'flashmaskv1': 'FlashMask V1',
+    'flexattention': 'FlexAttention',
+    'fa4_mask_mod': 'FA4 mask_mod',
+    'flashmaskv4': 'FlashMask V4 (KV split)',
+    'flashmaskv4kvshared': 'FlashMask V4 (KV shared)',
+    'mlasparseattn': 'MLA Sparse Attn (+mask)',
+    'tilelangswamqa': 'TileLang SWA MQA (+mask)',
+}
+
+COLORS = ['#39CFC5', '#FF7D5E', '#6A5ACD', '#FFA500', '#32CD32', '#FF1493', '#00CED1', '#FFD700']
+
 
 def plot_radar_grid(rows, save_path, methods,
                     suptitle=None,
@@ -137,15 +158,7 @@ def plot_radar_grid(rows, save_path, methods,
                                     bbox=dict(boxstyle="round,pad=0.19", fc="#f7f7f7", ec=method_color, lw=0.7, alpha=0.7))
 
     handles, legend_labels = axs[0].get_legend_handles_labels()
-    method_name_mapping = {
-        'old_flashmaskv3': 'FlashMask V3 B.O.',
-        'flashmaskv3': 'FlashMask V3',
-        'flashmaskv1': 'FlashMask V1',
-        'flexattention': 'FlexAttention',
-        'fa4_mask_mod': 'FA4 mask_mod',
-        'flashmaskv4': 'FlashMask V4',
-    }
-    legend_labels = [method_name_mapping.get(label, label) for label in legend_labels]
+    legend_labels = [METHOD_LABELS.get(label, label) for label in legend_labels]
 
     fig.legend(
         handles, legend_labels, loc='upper center', bbox_to_anchor=(0.5, 0.955),
@@ -160,6 +173,94 @@ def plot_radar_grid(rows, save_path, methods,
     plt.savefig(save_path, dpi=300)
     plt.savefig(save_path + '.pdf', dpi=300, format='pdf')
     plt.close(fig)
+
+
+def plot_bar_grid(rows, save_path, methods,
+                  suptitle=None,
+                  show_value_labels=True,
+                  show_percent_label=True):
+    """Grouped bar version of plot_radar_grid, same ``rows`` structure.
+
+    A radar with two or three axes degenerates into a line or a triangle and is
+    hard to read; grouped bars stay legible for any number of Operations, which
+    is the usual case when only a couple of mask patterns are comparable across
+    methods.
+    """
+    font_prop = fm.FontProperties()
+    plt.rcParams['axes.unicode_minus'] = False
+
+    num_rows = len(rows)
+    num_cols = max(len(r['categories']) for r in rows)
+    fig = plt.figure(figsize=(1.9 * max(3, num_cols * 3), 4.2 * num_rows))
+    gs = gridspec.GridSpec(nrows=num_rows, ncols=num_cols)
+    axs = []
+
+    for r_idx, row in enumerate(rows):
+        row_label = row['row_label']
+        for c_idx, (category, data) in enumerate(row['categories'].items()):
+            labels = data['labels']
+            num_vars = len(labels)
+            x = np.arange(num_vars)
+            width = 0.8 / max(1, len(methods))
+
+            ax = fig.add_subplot(gs[r_idx, c_idx])
+            axs.append(ax)
+
+            all_vals = [v for m in methods for v in data[m]]
+            max_v = max(all_vals) if all_vals else 1.0
+
+            for i, method in enumerate(methods):
+                values = data[method]
+                color = COLORS[i % len(COLORS)]
+                pos = x - 0.4 + width * (i + 0.5)
+                ax.bar(pos, values, width=width * 0.92, color=color,
+                       label=method, edgecolor='white', linewidth=0.6)
+                if show_value_labels:
+                    for xi, val in zip(pos, values):
+                        ax.text(xi, val + max_v * 0.015, f'{val:.1f}',
+                                ha='center', va='bottom', fontsize=8, color=color,
+                                fontproperties=font_prop)
+                if show_percent_label and i > 0:
+                    base = data[methods[0]]
+                    for xi, val, bval in zip(pos, values, base):
+                        if bval == 0:
+                            continue
+                        inc = (val / bval - 1) * 100
+                        ax.text(xi, val + max_v * 0.075, f'{inc:+.1f}%',
+                                ha='center', va='bottom', fontsize=8.5, color=color,
+                                fontweight='bold', fontproperties=font_prop,
+                                bbox=dict(boxstyle="round,pad=0.16", fc="#f7f7f7",
+                                          ec=color, lw=0.6, alpha=0.75))
+
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels, fontsize=9, rotation=18, ha='right')
+            ax.set_ylabel(data['xlabel'], fontsize=9, fontproperties=font_prop)
+            ax.set_ylim(0, max_v * 1.22)
+            ax.set_title(f"{category}", size=9, fontproperties=font_prop)
+            ax.text(0.01, 1.06, row_label.upper(), transform=ax.transAxes,
+                    ha='left', va='center', color='#9AA7B8', fontweight='bold',
+                    fontsize=13, fontproperties=font_prop)
+            ax.grid(axis='y', linestyle=':', linewidth=0.6, alpha=0.6)
+            ax.set_axisbelow(True)
+            for side in ('top', 'right'):
+                ax.spines[side].set_visible(False)
+
+    handles, legend_labels = axs[0].get_legend_handles_labels()
+    legend_labels = [METHOD_LABELS.get(label, label) for label in legend_labels]
+    fig.legend(
+        handles, legend_labels, loc='upper center', bbox_to_anchor=(0.5, 0.965),
+        ncol=min(len(methods), 4),
+        prop=font_prop.copy().set_size(12), frameon=False
+    )
+
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=13, fontproperties=font_prop, y=0.995)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    plt.savefig(save_path, dpi=300)
+    plt.savefig(save_path + '.pdf', dpi=300, format='pdf')
+    plt.close(fig)
+
 
 
 def compute_improvement_range(rows, methods):
@@ -203,7 +304,29 @@ def get_column_name(df, target, strip=True, startswith=False):
             return col
     raise KeyError(f"No column found for '{target}' (strip={strip}, startswith={startswith})")
 
-def main(methods: list = ["flashmaskv1", "flashmaskv3"]):
+def parse_head_dims(head_dims):
+    """['576,512', 128] -> [(576, 512), (128, 128)].
+
+    A bare head dim keeps the old derivation (dv == d, except 192 -> 128); the
+    'd,dv' form is what the MLA-shaped runs need (576/512), where dv cannot be
+    derived from d.
+    """
+    pairs = []
+    for item in head_dims:
+        text = str(item)
+        if ',' in text:
+            d_str, dv_str = text.split(',', 1)
+            pairs.append((int(d_str), int(dv_str)))
+        else:
+            d = int(text)
+            pairs.append((d, 128 if d == 192 else d))
+    return pairs
+
+
+def main(methods: list = ["flashmaskv1", "flashmaskv3"],
+         head_dims: list = [128, 192, 256],
+         seqlens: list = [4096, 8192, 32768, 65536, 131072],
+         chart: str = "radar"):
     plt.rcParams['font.family'] = "DejaVu Sans"
     print("Drawing radar plot with : ", methods)
 
@@ -229,13 +352,12 @@ def main(methods: list = ["flashmaskv1", "flashmaskv3"]):
     }
 
     for dtype in ['bf16']:
-        for headdim in [128, 192, 256]:
-            headdim_v = 128 if headdim == 192 else headdim
+        for headdim, headdim_v in parse_head_dims(head_dims):
             rows = []
             # for kernel in ["fwd", "bwd", "total", "fwd_time", "bwd_time", "total_time", "sparsity"]:
             for kernel in kernels:
                 categories = {}
-                for seqlen in [4096, 8192, 32768, 131072]:
+                for seqlen in seqlens:
                     method_to_df = {}
                     metric = None
                     non_numeric_column = None
@@ -255,13 +377,29 @@ def main(methods: list = ["flashmaskv1", "flashmaskv3"]):
                         df = dataframes[0]
                         non_numeric_column = get_column_name(df, 'Operation')
                         metric = get_column_name(df, kernel_metric_col[kernel])
-                        columns_to_average = [metric]
 
-                        aligned_dataframes = [d[columns_to_average] for d in dataframes]
-                        combined_data = pd.concat(aligned_dataframes, axis=0, keys=range(len(dataframes)))
-                        mean_df = combined_data.groupby(level=1).mean()
-                        mean_df[non_numeric_column] = dataframes[0][non_numeric_column]
-                        mean_df = mean_df[[non_numeric_column] + columns_to_average]
+                        # Average across the samples of this seqlen by Operation
+                        # NAME, not by row position: --dedup_static_masks makes
+                        # benchmark_flashmask.py emit the S-only masks (Full,
+                        # Causal, ...) on the first sample only, so the files of
+                        # one seqlen no longer share a row count or a row order.
+                        # A positional mean would blend different masks together
+                        # and then label them from the first file.
+                        frames = []
+                        for d in dataframes:
+                            frames.append(pd.DataFrame({
+                                non_numeric_column: d[get_column_name(d, 'Operation')].astype(str).str.strip(),
+                                metric: pd.to_numeric(d[get_column_name(d, kernel_metric_col[kernel])], errors='coerce'),
+                            }))
+                        combined_data = pd.concat(frames, axis=0, ignore_index=True)
+                        grouped = combined_data.groupby(non_numeric_column, sort=False)
+                        mean_df = grouped[metric].mean().reset_index()
+                        counts = grouped[metric].count()
+                        if counts.nunique() > 1:
+                            print(f"Note: Method {method} seqlen {seqlen} averaged an "
+                                  f"uneven number of samples per Operation "
+                                  f"(expected with --dedup_static_masks): "
+                                  f"{counts.to_dict()}")
                         method_to_df[method] = mean_df
                         print('='*20)
                         print(f"Method {method} data:")
@@ -339,10 +477,12 @@ def main(methods: list = ["flashmaskv1", "flashmaskv3"]):
                             f"total improvement range: {a:+.1f}% ~ {b:+.1f}%")
 
             methods_str = "_vs_".join(methods)
-            save_path = f'{root_dir}/fig/{methods_str}_{dtype}_{headdim}_fwd_bwd_total'
-            plot_radar_grid(rows, save_path, methods,
-                            suptitle=suptitle,
-                            show_value_labels=True, show_percent_label=True)
+            kind = 'radar' if chart == 'radar' else 'bar'
+            save_path = f'{root_dir}/fig/{methods_str}_{dtype}_{headdim}_{headdim_v}_fwd_bwd_total_{kind}'
+            plot_fn = plot_radar_grid if chart == 'radar' else plot_bar_grid
+            plot_fn(rows, save_path, methods,
+                    suptitle=suptitle,
+                    show_value_labels=True, show_percent_label=True)
             print(f"Saved figure: {save_path}(.pdf)")
 
 if __name__ == "__main__":
@@ -355,6 +495,32 @@ if __name__ == "__main__":
         nargs='+',
         default=["flexattention", "flashmaskv3"],
         help="List of methods to compare (e.g., flashmaskv1 flashmaskv3 flexattention)"
+    )
+
+    parser.add_argument(
+        "--head_dims",
+        type=str,
+        nargs='+',
+        default=["128", "192", "256", "576,512"],
+        help="Head dims to plot. '128' derives dv from d (dv == d, 192 -> 128); "
+        "'576,512' gives d and dv explicitly, which is required for the "
+        "MLA-shaped runs where dv cannot be derived."
+    )
+
+    parser.add_argument(
+        "--seqlens",
+        type=int,
+        nargs='+',
+        default=[4096, 8192, 32768, 65536, 131072],
+        help="Sequence lengths to plot, one column each."
+    )
+
+    parser.add_argument(
+        "--chart",
+        type=str,
+        default="radar",
+        help="'radar' (default) or 'bar'. Prefer 'bar' when only two or three "
+        "Operations are shared across methods -- a 2-axis radar is just a line."
     )
 
     args = parser.parse_args()
