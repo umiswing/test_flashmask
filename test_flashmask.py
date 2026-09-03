@@ -27,7 +27,7 @@ from generate_startend_row_indices import (
   generate_empty_mask,
 )
 from functools import partial
-from test_util import attention_ref, detect_fa_versions
+from test_util import attention_ref, detect_fa_versions, kv_shared_detected, KV_SHARED_D_DV
 
 # batch_size, seqlen_q, seqlen_k, nheads, nheads_kv
 shape_cases = (
@@ -76,32 +76,6 @@ print(f"  - Original Count: {_shape_cases_before}")
 print(f"  - Unique Count:   {len(shape_cases)}")
 print(f"  - Removed:        {_shape_cases_before - len(shape_cases)}")
 print(f"{'='*60}")
-
-# KV shared is only implemented for these (d, dv): the backward merges dK and dV
-# into one accumulator, which needs a chunk layout that covers both axes.
-KV_SHARED_D_DV = ((512, 512), (576, 512))
-
-
-def kv_shared_detected(k, v):
-    """Whether the backward will take its kv-shared path for these two tensors.
-
-    Verbatim the predicate in flash_mask/cute/interface.py:1272-1280 minus the
-    (d, dv) gate. Duplicated here so the test can ASSERT which path it exercised:
-    if paddle ever materialises ``k[..., :dv]`` as a copy, the merge would
-    silently not run and the test would pass while covering nothing.
-    """
-    try:
-        same_storage = k.data_ptr() == v.data_ptr()
-    except (AttributeError, RuntimeError):
-        return False
-    return (
-        same_storage
-        and k.dtype == v.dtype
-        and list(k.shape[:-1]) == list(v.shape[:-1])
-        and v.shape[-1] <= k.shape[-1]
-        and tuple(k.strides[:-1]) == tuple(v.strides[:-1])
-    )
-
 
 d_dv_cases = [
     (32, 32),
