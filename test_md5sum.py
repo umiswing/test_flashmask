@@ -1,8 +1,8 @@
-# run this to check aadiff:
-# python -m pytest -v test_fwd_md5sum.py
+# run this to check aadiff (forward out + backward dq/dk/dv in one shot):
+# python -m pytest -v test_md5sum.py
 #
-# run this to record the fwd md5sum (only necessary when you want to update ground truth):
-# python test_fwd_md5sum.py
+# run this to record the md5sum (only necessary when you want to update ground truth):
+# python test_md5sum.py
 import os
 import json
 import itertools
@@ -25,7 +25,7 @@ from generate_startend_row_indices import (
     generate_qk_sparse_mask,
     generate_random_eviction_mask
 )
-from test_util import attention_ref, detect_fa_versions
+from test_util import detect_fa_versions, kv_shared_detected, KV_SHARED_D_DV, BIG_D_DV
 try:
     from flash_mask.cute.interface import flashmask_attention
 except (ImportError, ModuleNotFoundError):
@@ -53,55 +53,115 @@ d_dv_combinations = [
     (128, 128),
     (192, 128),
     (256, 256),
+    (512, 512),
+    (576, 512),
 ]
 
-def get_gt_filename(base="flashmask_fwd_gt"):
+# "split": k and v are two independent buffers, so dq / dk / dv all come back
+# separately. "shared": v is a stride-1 view onto k (the MLA convention,
+# v = k[..., :dv]); k is then the only leaf, the kernel merges dK and dV into
+# one accumulator and k.grad carries dK + dV, so there is no dv to record.
+kv_modes = ["split", "shared"]
+
+def get_gt_filename(base="flashmask_gt"):
     # Tag the ground truth file with the fa version(s) so fa3 and fa4 ground
-    # truth can coexist, e.g. flashmask_fwd_gt_fa3.json / flashmask_fwd_gt_fa4.json.
+    # truth can coexist, e.g. flashmask_gt_fa3.json / flashmask_gt_fa4.json.
     version_tag = "_".join(str(v) for v in fa_versions)
     return f"{base}_fa{version_tag}.json"
 
 GT_FILE = get_gt_filename()
 
+
+def _is_oom(exc):
+    # Paddle maps a GPU BadAlloc to MemoryError, but the same condition also
+    # surfaces as an EnforceNotMet carrying ResourceExhausted, so match on the
+    # message too. Anything else must NOT be swallowed while recording.
+    if isinstance(exc, MemoryError):
+        return True
+    msg = str(exc)
+    return "ResourceExhausted" in msg or "Out of memory" in msg or "out of memory" in msg
+
 def record_gt(output_file=GT_FILE):
     gt_records = {}
-    
+
     param_combinations = generate_all_param_combinations()
-    
+
     print(f"Start recording test cases, {len(param_combinations)} test cases in total.")
-    
+
     for i, params in enumerate(param_combinations):
         try:
-            out = run_flashmask_forward(**params)
-            md5sum = out._md5sum()
+            out_md5, dq_md5, dk_md5, dv_md5 = run_flashmask(**params)
             param_key = generate_param_key(params)
-            
-            gt_records[param_key] = md5sum
+
+            gt_records[param_key] = {
+                "out": out_md5,
+                "dq": dq_md5,
+                "dk": dk_md5,
+                # None in kv-shared mode: dV is folded into dk.
+                "dv": dv_md5,
+            }
             if (i + 1) % 10 == 0:
                 print(f"{i+1}/{len(param_combinations)} test cases recorded")
-                
+
         except pytest.skip.Exception as e:
             print(f"Skipping test case due to exception: {params}: {e}")
             continue
-    gt_records["gt_commit_id"] = input("Please input the commit ID of fwd GT md5sum: ")
-    gt_records["gt_commit_msg"] = input("Please input the commit msg of fwd GT md5sum: ")
+        except Exception as e:
+            # A shape that does not fit is recorded as "no ground truth", which
+            # makes pytest skip it, instead of aborting the whole recording run.
+            if not _is_oom(e):
+                raise
+            print(f"Skipping test case, out of memory: {params}: {e}")
+            paddle.device.cuda.empty_cache()
+            continue
+    gt_records["gt_commit_id"] = input("Please input the commit ID of GT md5sum: ")
+    gt_records["gt_commit_msg"] = input("Please input the commit msg of GT md5sum: ")
     with open(output_file, 'w') as f:
         json.dump(gt_records, f, indent=2)
-    
+
     print(f"Ground truth saved to '{output_file}', {len(gt_records)} test cases recorded.")
     return gt_records
 
+def run_flashmask(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv,
+                  nheads_startend_row_indices, fa_version, dtype, mask_type,
+                  gen_startend_row_indices, kv_mode="split", softcap=0.0):
+    """One forward + backward, returning the md5 of out and of every gradient.
 
-def run_flashmask_forward(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, 
-                         nheads_startend_row_indices, fa_version, dtype, mask_type,
-                         gen_startend_row_indices, softcap=0.0):
+    The backward needs the forward anyway, so both directions are checked from a
+    single run: the forward md5 costs nothing on top of the backward.
+    """
     paddle.seed(2024)
     np.random.seed(2024)
     assert nheads % nheads_kv == 0
-    
+
+    big_d = (d, dv) in BIG_D_DV
+    if big_d and fa_version != 4:
+        pytest.skip(f"Skipping d{d}-dv{dv}: big head_dim needs fa4 (SM100)")
+
+    kv_shared = kv_mode == "shared"
+    if kv_shared and (d, dv) not in KV_SHARED_D_DV:
+        pytest.skip(f"Skipping kv shared for d{d}-dv{dv}: merge not implemented")
+    if kv_shared and fa_version != 4:
+        pytest.skip("Skipping kv shared on fa2/fa3: no big-headdim cutedsl backward")
+
     q = paddle.randn(shape=[batch_size, seqlen_q, nheads, d], dtype=dtype)
     k = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, d], dtype=dtype)
-    v = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, dv], dtype=dtype)
+
+    q.stop_gradient = False
+    k.stop_gradient = False
+
+    # The view is taken AFTER stop_gradient is cleared, so k is the leaf and
+    # autograd folds dV back into k.grad the same way the kernel's merged
+    # accumulator does.
+    if kv_shared:
+        v = k[..., :dv]
+        assert kv_shared_detected(k, v), (
+            "v is not a stride-1 view onto k -- paddle materialised the slice, "
+            "so the kernel's kv-shared path would not be exercised"
+        )
+    else:
+        v = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, dv], dtype=dtype)
+        v.stop_gradient = False
 
     startend_row_indices, causal = gen_startend_row_indices(
         batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices
@@ -119,14 +179,25 @@ def run_flashmask_forward(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, 
     else:
         raise ValueError(f"Invalid flash attention version: {fa_version}")
 
+    paddle.set_flags({'FLAGS_cudnn_deterministic': 1})
     out, lse = flashmask_attention(
         q, k, v,
         startend_row_indices=startend_row_indices,
         causal=causal,
         return_softmax_lse=True
     )
-    
-    return out
+
+    out_md5 = out._md5sum()
+
+    g = paddle.randn(shape=[batch_size, seqlen_q, nheads, dv], dtype=dtype)
+    out.backward(g)
+
+    dq_md5 = q.grad._md5sum()
+    dk_md5 = k.grad._md5sum()
+    # In shared mode v is a view, not a leaf: dV is already merged into k.grad.
+    dv_md5 = None if kv_shared else v.grad._md5sum()
+
+    return out_md5, dq_md5, dk_md5, dv_md5
 
 
 # 形状组合
@@ -149,47 +220,54 @@ def generate_shapes():
 
 def generate_all_param_combinations():
     combinations = []
-    
+
     dtypes = [paddle.bfloat16]
-    
+
     for batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices in generate_shapes():
         for dtype in dtypes:
             for fa_version in fa_versions:
                 for d, dv in d_dv_combinations:
-                    for mask_type, gen_func in GEN_FUNCTIONS_DICT.items():
-                        params = {
-                            'batch_size': batch_size,
-                            'seqlen_q': seqlen_q,
-                            'seqlen_k': seqlen_k,
-                            'nheads': nheads,
-                            'nheads_kv': nheads_kv,
-                            'd': d,
-                            'dv': dv,
-                            'nheads_startend_row_indices': nheads_startend_row_indices,
-                            'fa_version': fa_version,
-                            'dtype': dtype,
-                            'mask_type': mask_type,
-                            'gen_startend_row_indices': gen_func,
-                            'softcap': 0.0
-                        }
-                        combinations.append(params)
-    
+                    for kv_mode in kv_modes:
+                        for mask_type, gen_func in GEN_FUNCTIONS_DICT.items():
+                            params = {
+                                'batch_size': batch_size,
+                                'seqlen_q': seqlen_q,
+                                'seqlen_k': seqlen_k,
+                                'nheads': nheads,
+                                'nheads_kv': nheads_kv,
+                                'd': d,
+                                'dv': dv,
+                                'nheads_startend_row_indices': nheads_startend_row_indices,
+                                'fa_version': fa_version,
+                                'dtype': dtype,
+                                'mask_type': mask_type,
+                                'gen_startend_row_indices': gen_func,
+                                'kv_mode': kv_mode,
+                                'softcap': 0.0
+                            }
+                            combinations.append(params)
+
     return combinations
 
 
 def generate_param_key(params):
     nheads_startend = params['nheads_startend_row_indices']
     dtype_index = get_dtype_index(params['dtype'])
-    
+
     if isinstance(nheads_startend, (list, tuple)):
         nheads_startend_str = '_'.join(map(str, nheads_startend))
     else:
         nheads_startend_str = str(nheads_startend)
-    
+
+    # Only the shared mode is suffixed, so the split keys stay byte-identical to
+    # the ones the separate fwd / bwd ground truth files used.
+    kv_suffix = "-kvshared" if params.get('kv_mode', 'split') == 'shared' else ""
+
     return (f"{params['mask_type']}-"
             f"{params['batch_size']}-{params['seqlen_q']}-{params['seqlen_k']}-"
             f"{params['nheads']}-{params['nheads_kv']}-{nheads_startend_str}-"
-            f"{params['d']}-{params['dv']}-{params['fa_version']}-dtype{dtype_index}")
+            f"{params['d']}-{params['dv']}-{params['fa_version']}-dtype{dtype_index}"
+            f"{kv_suffix}")
 
 def get_dtype_index(dtype):
     dtype_list = [paddle.bfloat16]
@@ -209,6 +287,7 @@ except FileNotFoundError:
 
 @pytest.mark.parametrize("dtype", [paddle.bfloat16])
 @pytest.mark.parametrize("fa_version", fa_versions)
+@pytest.mark.parametrize("kv_mode", kv_modes)
 @pytest.mark.parametrize("d, dv", d_dv_combinations)
 @pytest.mark.parametrize(
     "batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices",
@@ -219,8 +298,8 @@ except FileNotFoundError:
     list(GEN_FUNCTIONS_DICT.items()),
 )
 def test_flashmask_md5(
-    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, 
-    nheads_startend_row_indices, fa_version, dtype, mask_type, gen_startend_row_indices, softcap=0.0
+    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv,
+    nheads_startend_row_indices, kv_mode, fa_version, dtype, mask_type, gen_startend_row_indices, softcap=0.0
 ):
     params = {
         'batch_size': batch_size,
@@ -235,20 +314,24 @@ def test_flashmask_md5(
         'dtype': dtype,
         'mask_type': mask_type,
         'gen_startend_row_indices': gen_startend_row_indices,
+        'kv_mode': kv_mode,
         'softcap': softcap
     }
-    
+
     param_key = generate_param_key(params)
-    
+
     if param_key not in gt_records:
         pytest.skip(f"No ground truth record for {param_key}")
-    
-    out = run_flashmask_forward(**params)
-    
-    actual_md5 = out._md5sum()
-    expected_md5 = gt_records[param_key]
-    
-    assert actual_md5 == expected_md5, f"MD5 mismatch for {param_key}\nExpected: {expected_md5}\nGot: {actual_md5}"
+
+    out_md5, dq_md5, dk_md5, dv_md5 = run_flashmask(**params)
+
+    expected = gt_records[param_key]
+
+    assert out_md5 == expected["out"], f"out MD5 mismatch for {param_key}\nExpected: {expected['out']}\nGot: {out_md5}"
+    assert dq_md5 == expected["dq"], f"dq MD5 mismatch for {param_key}\nExpected: {expected['dq']}\nGot: {dq_md5}"
+    assert dk_md5 == expected["dk"], f"dk MD5 mismatch for {param_key}\nExpected: {expected['dk']}\nGot: {dk_md5}"
+    # dv is null for kv-shared records: the dk check above is the dKV check.
+    assert dv_md5 == expected["dv"], f"dv MD5 mismatch for {param_key}\nExpected: {expected['dv']}\nGot: {dv_md5}"
 
 
 if __name__ == "__main__":

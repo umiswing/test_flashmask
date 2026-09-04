@@ -23,6 +23,37 @@ def detect_fa_versions():
     print(f"[detect_fa_versions] auto-detected fa_versions={versions}")
     return versions
 
+
+# KV shared is only implemented for these (d, dv): the backward merges dK and dV
+# into one accumulator, which needs a chunk layout that covers both axes.
+KV_SHARED_D_DV = ((512, 512), (576, 512))
+
+# Large head dims run the SM100 (fa4) big-headdim kernels only -- see
+# _is_valid_flash_dims in flash_mask/cute/interface.py.
+BIG_D_DV = ((512, 512), (576, 512))
+
+
+def kv_shared_detected(k, v):
+    """Whether the backward will take its kv-shared path for these two tensors.
+
+    Verbatim the predicate in flash_mask/cute/interface.py:1283-1293 minus the
+    (d, dv) gate. Mirrored here so a test can ASSERT which path it exercised:
+    if paddle ever materialises ``k[..., :dv]`` as a copy, the merge would
+    silently not run and the test would pass while covering nothing.
+    """
+    try:
+        same_storage = k.data_ptr() == v.data_ptr()
+    except (AttributeError, RuntimeError):
+        return False
+    return (
+        same_storage
+        and k.dtype == v.dtype
+        and list(k.shape[:-1]) == list(v.shape[:-1])
+        and v.shape[-1] <= k.shape[-1]
+        and tuple(k.strides[:-1]) == tuple(v.strides[:-1])
+    )
+
+
 def construct_local_mask(
     seqlen_q,
     seqlen_k,
