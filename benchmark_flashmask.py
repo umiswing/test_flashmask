@@ -37,25 +37,10 @@ def cal_tflops(flops, time_ms):
     return  flops * (1e3 / time_ms) / 1e12
 
 # KV shared: k and v are ONE buffer (the MLA convention, v = k[..., :dv]) and the
-# SM100 big-headdim backward merges dK and dV into a single accumulator. Only these
-# (D, DV) pairs are implemented
-KV_SHARED_D_DV = ((512, 512), (576, 512))
-
-
-def kv_shared_detected(k, v):
-    """Whether the backward will take its kv-shared path for these two tensors.
-    """
-    try:
-        same_storage = k.data_ptr() == v.data_ptr()
-    except (AttributeError, RuntimeError):
-        return False
-    return (
-        same_storage
-        and k.dtype == v.dtype
-        and list(k.shape[:-1]) == list(v.shape[:-1])
-        and v.shape[-1] <= k.shape[-1]
-        and tuple(k.strides[:-1]) == tuple(v.strides[:-1])
-    )
+# SM100 big-headdim backward merges dK and dV into a single accumulator. The pair
+# list and the detection predicate live in test_util.py so that the benchmark and the
+# tests cannot drift apart (the predicate mirrors flash_mask/cute/interface.py).
+from test_util import KV_SHARED_D_DV, kv_shared_detected
 
 
 def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean"):
@@ -838,15 +823,15 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="", o
     # dict). Keep in sync with that file.
     VS_SPARSE_EXAMPLES = ("Causal", "Causal Document Mask")
 
-    # These masks are a function of S alone (Full/Causal, or a window / prefix /
-    # start row derived from S), so the 5 samples inside one "Total length" block
-    # of kernel_test_seq_info.txt all produce the identical mask. With
+    # These masks are a function of S alone (Full/Causal, or a window / global window /
+    # prefix / start row derived from S), so the 5 samples inside one "Total length"
+    # block of kernel_test_seq_info.txt all produce the identical mask. With
     # --dedup_static_masks they are measured on the first sample of each block only.
     # This applies under --vs_sparse_attn too: Causal is S-only there as well, so
     # only Causal Document Mask is left on the later samples. plot_radar averages
     # the samples of one seqlen by Operation name, so a row present in one sample
     # file and absent from the others is handled.
-    S_ONLY_EXAMPLES = ("Full", "Causal", "Sliding Window",
+    S_ONLY_EXAMPLES = ("Full", "Causal", "Sliding Window", "Global Sliding Window",
                        "Prefix LM Causal Mask", "Random Eviction Mask")
 
     if kv_mode is None:
@@ -986,6 +971,7 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="", o
                     "Full": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_none_mask, causal=False), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
                     "Causal": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_none_mask, causal=True), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
                     "Sliding Window": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_sliding_window_mask, window_size=int(S*0.0625)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
+                    "Global Sliding Window": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
                     "Causal Document Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
                     "Document Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
                     "Share Question Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
@@ -999,10 +985,6 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="", o
                     # "Dumped Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(load_mask, path=mask_path, causal=False, cp_size=cp_size, cp_rank=cp_rank), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
                     # "Hybrid SWA": lambda kv_mode: test_mask(generate_mask_fn=partial(load_mask, path=mask_path, causal=False, cp_size=cp_size, cp_rank=cp_rank, hybrid_mask_fn=partial(hybrid_swa, window_size=512, swa_ratio=0.75)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
                 }
-
-                # Global Sliding Window is enabled for fa3, but disabled for fa4.
-                if fm_version == 3:
-                    available_examples["Global Sliding Window"] = lambda kv_mode: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode)
 
 
                 if "all" in examples:

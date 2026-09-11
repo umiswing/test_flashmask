@@ -27,7 +27,7 @@ from generate_startend_row_indices import (
   generate_empty_mask,
 )
 from functools import partial
-from test_util import attention_ref, detect_fa_versions
+from test_util import attention_ref, detect_fa_versions, kv_shared_detected, KV_SHARED_D_DV
 
 # batch_size, seqlen_q, seqlen_k, nheads, nheads_kv
 shape_cases = (
@@ -77,32 +77,6 @@ print(f"  - Unique Count:   {len(shape_cases)}")
 print(f"  - Removed:        {_shape_cases_before - len(shape_cases)}")
 print(f"{'='*60}")
 
-# KV shared is only implemented for these (d, dv): the backward merges dK and dV
-# into one accumulator, which needs a chunk layout that covers both axes.
-KV_SHARED_D_DV = ((512, 512), (576, 512))
-
-
-def kv_shared_detected(k, v):
-    """Whether the backward will take its kv-shared path for these two tensors.
-
-    Verbatim the predicate in flash_mask/cute/interface.py:1272-1280 minus the
-    (d, dv) gate. Duplicated here so the test can ASSERT which path it exercised:
-    if paddle ever materialises ``k[..., :dv]`` as a copy, the merge would
-    silently not run and the test would pass while covering nothing.
-    """
-    try:
-        same_storage = k.data_ptr() == v.data_ptr()
-    except (AttributeError, RuntimeError):
-        return False
-    return (
-        same_storage
-        and k.dtype == v.dtype
-        and list(k.shape[:-1]) == list(v.shape[:-1])
-        and v.shape[-1] <= k.shape[-1]
-        and tuple(k.strides[:-1]) == tuple(v.strides[:-1])
-    )
-
-
 d_dv_cases = [
     (32, 32),
     (64, 64),
@@ -117,8 +91,24 @@ d_dv_cases = [
 
 fa_versions = detect_fa_versions()
 
+# learnable_sink supports fp16/bf16/fp32, independent of the q/k/v dtype.
+_SINK_DTYPES = [paddle.bfloat16, paddle.float16, paddle.float32]
+
 # Generate all combinations for second param
 def generate_shapes():
+    # sink dtype is round-robined over the generated cases: exactly uniform (the case
+    # count is a multiple of len(_SINK_DTYPES)), deterministic, adds no case, and shows
+    # up in the pytest id so a failure tells you the dtype without reading the log.
+    for i, (batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices) in (
+        enumerate(_generate_shape_params())
+    ):
+        yield (
+            batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices,
+            _SINK_DTYPES[i % len(_SINK_DTYPES)],
+        )
+
+
+def _generate_shape_params():
     for batch_size, seqlen_q, seqlen_k, nheads, nheads_kv in shape_cases:
         if nheads_kv == 1:
           nheads_startend_row_indices_values = [1]
@@ -138,7 +128,7 @@ def generate_shapes():
     ids=[f"d{c[0]}-dv{c[1]}" for c in d_dv_cases]
 )
 @pytest.mark.parametrize(
-    "batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices",
+    "batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices, sink_dtype",
     list(generate_shapes())
 )
 @pytest.mark.parametrize(
@@ -160,7 +150,7 @@ def generate_shapes():
     ],
 )
 def test_flashmask(
-    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, nheads_startend_row_indices, kv_mode, fa_version, dtype, gen_startend_row_indices, softcap=0.0
+    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, nheads_startend_row_indices, sink_dtype, kv_mode, fa_version, dtype, gen_startend_row_indices, softcap=0.0
 ):
     paddle.seed(2026)
     assert nheads % nheads_kv == 0
@@ -177,6 +167,11 @@ def test_flashmask(
 
     flashmask_impl = (fa_version == 3 or fa_version == 4)
 
+    # Only the fa4 cutedsl kernels handle head_dim > 256 (the big-headdim split path);
+    # fa2/fa3 have no such kernel and would fall back / fail.
+    if fa_version != 4 and max(d, dv) > 256:
+        pytest.skip(f"Skipping d{d}-dv{dv} on fa{fa_version}: head_dim > 256 is fa4 only")
+
     startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
 
     if (batch_size, seqlen_q, seqlen_k, nheads, nheads_kv) == (2, 7600, 7600, 32, 8) and fa_version == 3:
@@ -185,9 +180,6 @@ def test_flashmask(
     if (fa_version == 2 or (d == 192 and dv == 192)) and seqlen_q != seqlen_k and causal:
         # fa3/fa4 fallback to fa2
         pytest.skip(f"Skipping because running fa2 in causal when seqlen_q != seqlen_k")
-
-    if fa_version == 4 and startend_row_indices is not None and startend_row_indices.shape[-1] == 4:
-        pytest.skip(f"Skipping because running fa4 when startend_row_indices.shape[-1] == 4")
 
     use_sink = flashmask_impl and not (d == 192 and dv == 192)
 
@@ -234,7 +226,10 @@ def test_flashmask(
     attn_bias = startend_row_indices_to_attn_bias(startend_row_indices, seqlen_q, nheads, dtype, causal)
 
     if use_sink:
-        sink_ref = paddle.randn(shape=[nheads], dtype=dtype)
+        # sink_dtype comes from the shape parametrize (round-robined in generate_shapes),
+        # so it is independent of the q/k/v dtype and costs no extra case.
+        print(f"learnable_sink dtype: {sink_dtype}")
+        sink_ref = paddle.randn(shape=[nheads], dtype=paddle.float32).astype(sink_dtype)
         sink_bf16 = sink_ref.detach().clone()
         sink = sink_ref.detach().clone()
 
@@ -339,6 +334,12 @@ def test_flashmask(
         assert (v.grad - v_ref.grad).abs().max().item() <= rtol * (v_bf16.grad - v_ref.grad).abs().max().item() + dv_atol
 
     if use_sink:
+        assert sink.grad.dtype == sink_dtype, (
+            f"dsink dtype {sink.grad.dtype} != sink dtype {sink_dtype}"
+        )
+        assert bool(paddle.isfinite(sink.grad.astype(paddle.float32)).all().item()), (
+            f"dsink has inf/nan (sink dtype={sink_dtype}): {sink.grad}"
+        )
         print(f"flashmask dSink max diff: {(sink.grad - sink_ref.grad).abs().max().item()}")
         print(f"flashmask dSink mean diff: {(sink.grad - sink_ref.grad).abs().mean().item()}")
         print(f"Paddle naive bf16 dSink max diff: {(sink_bf16.grad - sink_ref.grad).abs().max().item()}")
@@ -348,12 +349,16 @@ def test_flashmask(
         delta = delta.transpose([0, 2, 1])                                 # (b, h, sq)
         p_sink = 1.0 - attn_ref.sum(-1)
 
-        err_scale = (p_sink * delta.abs()).sum(axis=[0, 2])                # (h,)
+        err_scale = (p_sink * delta.abs()).sum(axis=[0, 2]).astype(paddle.float32)   # (h,)
 
-        dsink_diff = (sink.grad - sink_ref.grad).abs()
+        # Compare in fp32: sink may be fp16/bf16/fp32, err_scale comes from bf16 attn_ref
+        dsink_diff = (
+            sink.grad.astype(paddle.float32) - sink_ref.grad.astype(paddle.float32)
+        ).abs()
         dsink_tol = 1e-2 + rtol * 2**-8 * err_scale
         assert bool((dsink_diff <= dsink_tol).all().item()), (
-            f"dsink mismatch: max_diff={dsink_diff.max().item():.6f}, "
+            f"dsink mismatch (sink dtype={sink_dtype}): "
+            f"max_diff={dsink_diff.max().item():.6f}, "
             f"max_tol={dsink_tol.max().item():.6f}, "
             f"err_scale_max={err_scale.max().item():.4f}"
         )
