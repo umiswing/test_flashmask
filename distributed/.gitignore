@@ -1,0 +1,9 @@
+# FM-4 CP-overlap unit test: track ONLY the Python sources, shell launchers, and
+# this file. Everything else -- run logs (log_cp*/), __pycache__/, *.out / *.log
+# scratch, dumps, and any other generated artifact -- is ignored.
+#
+# Whitelist style: ignore everything, then re-include the sources we commit.
+*
+!.gitignore
+!*.py
+!*.sh
