@@ -17,7 +17,7 @@ from attn_gym.masks import causal_mask
 
 from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
 
-from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
+from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd, _tile_size_fwd_sm90, _tile_size_bwd_sm90
 
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
 
@@ -37,6 +37,8 @@ np.random.seed(0)
 random.seed(0)
 
 torch._dynamo.config.cache_size_limit = 1000
+# dynamic-shape recompiles of create_block_mask return wrong mask_block_cnt; keep them static
+torch._dynamo.config.automatic_dynamic_shapes = False
 
 def compute_block_sparse_tensors(
     flex_mask_mod,
@@ -99,7 +101,8 @@ def compute_density_sparsity(flex_mask_mod, causal, B, H, M, N, tile_m, tile_n, 
     elif causal:
         # Note(umiswing): if seqlen_q != seqlen_k, the density of causal is not 0.5
         assert M == N
-        density = 0.5
+        # count skipped tile_m x tile_n blocks, same as flashmask_block_sparsity
+        density = 1 - (M // tile_m - 1) / (2 * (M // tile_m))
     else:
         density = 1.0
 
@@ -235,26 +238,44 @@ def test_mask(
     else:
         aux_tensors_cute = None
     causal = mask_info["causal"]
+    # Like FA4's own tests, never combine mask_mod with causal=True: fwd drops causal when a
+    # mask_mod is given but bwd keeps it, and causal + mask_mod + block sparsity gives wrong
+    # bwd gradients. The mask_mods carry their own causal term.
+    kernel_causal = causal if cute_mask_mod is None else False
 
-    tile_m = 128
-    tile_n = 128
-
-    sparse_tile_m_fwd = 2 * tile_m
+    major, _ = torch.cuda.get_device_capability()
+    if major == 9:
+        # SM90 has no kv subtiling: the sparse KV block must equal the kernel's tile_n
+        # (hdim256 -> 128x80, hdim192 -> 128x128; 128x128 overflows smem at hdim256).
+        fwd_cfg = _tile_size_fwd_sm90(D, DV, kernel_causal, False, sparse_block_size_q=256)
+        tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
+        sparse_tile_m_fwd = tile_m
+        # SM90 bwd picks its own tiles (hdim192 -> tile_n=96, hdim256 w/ block sparsity -> 64).
+        sparse_tile_n_bwd = _tile_size_bwd_sm90(D, DV, kernel_causal, False, sparse_block_size_q=sparse_tile_m_fwd).n_block_size
+    else:
+        tile_m = 128
+        tile_n = 128
+        sparse_tile_m_fwd = 2 * tile_m
+        # SM100 block-sparse bwd needs 2CTA (sparse KV block = 2*tile_n) only for hdim192.
+        sparse_tile_n_bwd = 2 * tile_n if D == 192 else tile_n
 
     if dtype == 'bf16':
         data_type = torch.bfloat16
     else:
         data_type = torch.float16
 
-    block_sparse_tensors_fwd, block_sparse_tensors_bwd = compute_block_sparse_tensors(
+    # Built once outside the timed fwd / bwd calls, like FA4's own benchmark (kernel-only timing).
+    block_sparse_tensors = lambda kv_block: compute_block_sparse_tensors(
         flex_mask_mod=flex_mask_mod,
         batch_size=B,
         block_mask_nheads=1 if pack_gqa else H, # TODO(umiswing): try pack_gqa
         seqlen_q=S,
         seqlen_k=S,
         sparse_tile_m=sparse_tile_m_fwd,
-        tile_n=tile_n,
+        tile_n=kv_block,
     )
+    bsp_fwd = block_sparse_tensors(tile_n)[0]
+    bsp_bwd = block_sparse_tensors(sparse_tile_n_bwd)[1]
 
     density, sparsity = compute_density_sparsity(
         flex_mask_mod=flex_mask_mod,
@@ -263,9 +284,12 @@ def test_mask(
         H=H,
         M=S,
         N=S,
-        tile_m=tile_m,
-        tile_n=tile_n
+        tile_m=128,
+        tile_n=128
     )
+    if mask_info.get("flashmask_sparsity") is not None:
+        sparsity = mask_info["flashmask_sparsity"]
+        density = 1.0 - sparsity
 
     q = torch.randn(B, S, H, D, device=device, dtype=data_type, requires_grad=True)
     k = torch.randn(B, S, HKV, D, device=device, dtype=data_type, requires_grad=True)
@@ -280,9 +304,9 @@ def test_mask(
 
     fa4_mask_mod_call = lambda: _flash_attn_fwd(
         q=q, k=k, v=v,
-        softmax_scale=None, causal=causal,
+        softmax_scale=None, causal=kernel_causal,
         tile_mn=(tile_m, tile_n),
-        mask_mod=cute_mask_mod, block_sparse_tensors=block_sparse_tensors_fwd,
+        mask_mod=cute_mask_mod, block_sparse_tensors=bsp_fwd,
         return_lse=True,
         pack_gqa=pack_gqa,
         out=out,
@@ -307,12 +331,12 @@ def test_mask(
         out=out_cute,
         dout=gradOut,
         lse=lse_cute,
-        causal=causal,
+        causal=kernel_causal,
         m_block_size=tile_m,
         n_block_size=tile_n,
         mask_mod=cute_mask_mod,
         # Note(umiswing): idk how to pass aux tensors in bm of bwd
-        block_sparse_tensors=block_sparse_tensors_bwd,
+        block_sparse_tensors=bsp_bwd,
         # block_sparse_tensors=None,
         aux_tensors=aux_tensors,
         pack_gqa=pack_gqa,
@@ -337,7 +361,7 @@ def test_mask(
 def generate_sliding_window(window_size: int):
 
     def sliding_window(b, h, q_idx, kv_idx):
-        return q_idx - kv_idx <= window_size
+        return q_idx - kv_idx < window_size
 
     sliding_window_mask = and_masks(sliding_window, causal_mask)
     sliding_window_mask.__name__ = f"sliding_window_{window_size}"
@@ -354,7 +378,7 @@ def generate_sliding_window(window_size: int):
         window_size_cute = utils.scalar_to_ssa(window_size, cutlass.Int32)
         offset = seqlen_info.seqlen_k - seqlen_info.seqlen_q
         offset_ssa = utils.scalar_to_ssa(offset, cutlass.Int32)
-        return (m_idx - n_idx <= window_size_cute) & (n_idx <= (m_idx + offset_ssa))
+        return (m_idx - n_idx < window_size_cute) & (n_idx <= (m_idx + offset_ssa))
 
     return {
         "cute_mask_mod": cute_sliding_window,
@@ -664,7 +688,7 @@ def generate_prefix_lm_causal_mask(B=16, S=8192, prefix_length=1024, device="cud
         "cute_mask_mod": cute_prefix_lm_causal_mask,
         "flex_mask_mod": prefix_lm_causal_mask,
         "aux_tensors": [up_right_row_indices],
-        "causal": True, # Note(umiswing): should this be true?
+        "causal": False, # the prefix is bidirectional, same as benchmark_flashmask
     }
 
 def generate_qk_sparse_mask(B=16, S=8192, maskout_pair=[(1024, 538), (2358, 1700)], device="cuda"):
@@ -685,6 +709,17 @@ def generate_qk_sparse_mask(B=16, S=8192, maskout_pair=[(1024, 538), (2358, 1700
     row_indices.extend(list(range(last_offset, S)))
 
     assert len(row_indices) == S, len(row_indices)
+
+    # Sparsity as benchmark_flashmask.flashmask_block_sparsity counts this mask (LT range
+    # [kv_idx, row_indices) under causal): unlike create_block_mask it keeps the diagonal
+    # blocks of a masked-out span, so report the same FLOPs base as flashmask.
+    T = S // 128
+    lt_start_max = np.arange(1, T + 1) * 128 - 1
+    lt_end_min = np.asarray(row_indices).reshape(T, 128).min(-1)
+    i = np.arange(T).reshape(T, 1)
+    skip = (np.arange(T) > i) | ((i * 128 >= lt_start_max) & ((i + 1) * 128 <= lt_end_min))
+    flashmask_sparsity = skip.sum() / (T * T)
+
     row_indices = torch.tensor(row_indices, device=device, dtype=torch.int32).reshape((1, -1)).repeat_interleave(B, 0)
 
     def qk_sparse_mask(b, h, q_idx, kv_idx):
@@ -707,6 +742,7 @@ def generate_qk_sparse_mask(B=16, S=8192, maskout_pair=[(1024, 538), (2358, 1700
         "flex_mask_mod": qk_sparse_mask,
         "aux_tensors": [row_indices],
         "causal": True, # Note(umiswing): should this be true?
+        "flashmask_sparsity": flashmask_sparsity,
     }
 
 
@@ -833,13 +869,14 @@ def split_sequence(sequence_length):
 
     return lengths
 
-def main(examples: List[str] = ["all"], dtype='bf16'):
+def main(examples: List[str] = ["all"], dtype='bf16', head_dim=None, current_time=None):
     """Run the benchmark with the given examples.
 
     Args:
         examples: List of examples to run. If "all" is specified, all examples will be run.
     """
-    current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
+    if current_time is None:
+        current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
     total_length = 0
     doc_seq_lens_list = []
     with open('kernel_test_seq_info.txt', 'r') as f:
@@ -856,7 +893,9 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
             
         #doc_seq_lens_list = doc_seq_lens_list[::-1]
         # Note(umiswing): fa4 does not support d 256
-        for D in [128]:
+        # One head_dim per process (--head_dim), like benchmark_flashmask.py: the RNG-dependent
+        # masks (Share Question, Random Eviction) then start from the same seed 0 as there.
+        for D in ([128, 192, 256] if head_dim is None else [head_dim]):
             if D == 192:
                 DV = 128
                 H = 16
@@ -906,6 +945,10 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
 
                 results = []
                 for ex in ex_to_run:
+                    # SM100 hdim256 uses a dedicated kernel without mask_mod/block sparsity support
+                    if torch.cuda.get_device_capability()[0] in (10, 11) and D == 256 and ex not in ("Full", "Causal"):
+                        print(f"Warning: SM100 hdim256 does not support mask_mod, skipping '{ex}'.")
+                        continue
                     if ex in available_examples:
                         print(ex)
                         fw_time, bw_time, total_time, fw_flops, bw_flops, total_flops, fw_tflops, bw_tflops, total_tflops, sparsity = available_examples[ex]()
@@ -959,6 +1002,19 @@ if __name__ == "__main__":
         "--dtype",
         type=str,
         default="bf16"
+    )
+    parser.add_argument(
+        "--head_dim",
+        type=int,
+        default=None,
+        help="Run only this head_dim (128 / 192 / 256), like benchmark_flashmask.py --head_dim. "
+        "Default: all three in one process (the random masks of 192 / 256 then differ from flashmask's).",
+    )
+    parser.add_argument(
+        "--current_time",
+        type=str,
+        default=None,
+        help="Timestamp used in the CSV file names (default: now), like benchmark_flashmask.py --current_time.",
     )
 
     args = parser.parse_args()
