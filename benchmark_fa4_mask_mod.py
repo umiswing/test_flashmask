@@ -94,20 +94,98 @@ def compute_block_sparse_tensors(
         block_sparse_tensors_bwd = None
     return block_sparse_tensors_fwd, block_sparse_tensors_bwd
 
-def compute_density_sparsity(flex_mask_mod, causal, B, H, M, N, tile_m, tile_n, device="cuda"):
-    if flex_mask_mod is not None:
-        block_mask = create_block_mask(flex_mask_mod, B, H, M, N, device=device, _compile=True, BLOCK_SIZE=[tile_m, tile_n])
-        density = (100 - block_mask.sparsity()) / 100
-    elif causal:
-        # Note(umiswing): if seqlen_q != seqlen_k, the density of causal is not 0.5
-        assert M == N
-        # count skipped tile_m x tile_n blocks, same as flashmask_block_sparsity
-        density = 1 - (M // tile_m - 1) / (2 * (M // tile_m))
+def compute_density_sparsity(flex_mask_mod, causal, B, H, M, N, tile_m, tile_n, device="cuda", aux_tensors=None):
+    """Element-level density: the exact fraction of visible (q, k) pairs.
+
+    Same convention as FA4's benchmarks and benchmark_flashmask.flashmask_element_sparsity,
+    so it does not depend on any kernel's tiles; tile_m / tile_n are unused. The mask_mod
+    is evaluated row chunk by row chunk on the GPU (never a dense B*H*M*N tensor), and
+    over all heads only when an aux tensor is [B, H, S] (head-dependent mask).
+    """
+    if flex_mask_mod is None:
+        if causal:
+            # bottom-right aligned, like the kernels
+            q = torch.arange(M, dtype=torch.int64)
+            density = (q + N - M + 1).clamp(0, N).sum().item() / (M * N)
+        else:
+            density = 1.0
     else:
-        density = 1.0
+        per_head = aux_tensors is not None and any(t.dim() == 3 for t in aux_tensors)
+        hmask = H if per_head else 1
+        h_idx = torch.arange(hmask, device=device).view(hmask, 1, 1)
+        kv_idx = torch.arange(N, device=device).view(1, 1, N)
+        row_chunk = max(1, (1 << 28) // (hmask * N))
+        visible = torch.zeros((), dtype=torch.int64, device=device)
+        for b in range(B):
+            b_idx = torch.tensor(b, device=device)
+            for r0 in range(0, M, row_chunk):
+                q_idx = torch.arange(r0, min(r0 + row_chunk, M), device=device).view(1, -1, 1)
+                vis = flex_mask_mod(b_idx, h_idx, q_idx, kv_idx)
+                visible += torch.broadcast_to(vis, (hmask, q_idx.shape[1], N)).sum()
+        density = visible.item() / (B * hmask * M * N)
 
     sparsity = 1.0 - density
     return density, sparsity
+
+# Copied verbatim from benchmark_flashmask.py (which imports paddle at module level, so it
+# cannot be imported here). The reported sparsity is therefore computed exactly as for
+# flashmask, from the same startend_row_indices layout.
+def flashmask_element_sparsity(causal, flashmask, S, SKV):
+    """Fraction of masked (q, k) elements, independent of the kernel's tile sizes.
+
+    Same convention as FA4's benchmarks: FLOPs = density * dense FLOPs, where density
+    is the exact fraction of visible elements. For key column j the masked rows are the
+    union of [0, j - (SKV - S)) (causal, bottom-right aligned), [LTS_j, LTE_j) and
+    [UTS_j, UTE_j). q heads broadcast uniformly over mask heads, so the ratio over
+    the mask's [B, H_mask] equals the ratio over [B, H].
+    """
+    if flashmask is None and not causal:
+        return 0.0
+
+    row = np.arange(S, dtype=np.int64)
+    if flashmask is None:
+        visible = np.clip(row + SKV - S + 1, 0, SKV).sum()
+        return 1.0 - visible / (S * SKV)
+
+    fm = flashmask.cpu().detach().numpy().astype(np.int64)
+    assert fm.shape[2] == SKV, f"startend_row_indices seqlen {fm.shape[2]} != SKV {SKV}"
+    num_vecs = fm.shape[-1]
+    zero = np.zeros(fm.shape[:3], dtype=np.int64)
+    full = np.full(fm.shape[:3], S, dtype=np.int64)
+    # Empty intervals [0, 0) for whatever this layout does not carry.
+    LTS, LTE, UTS, UTE = full, full, zero, zero
+    if num_vecs == 4:
+        LTS, LTE, UTS, UTE = fm[..., 0], fm[..., 1], fm[..., 2], fm[..., 3]
+    elif num_vecs == 2 and causal:
+        LTS, LTE = fm[..., 0], fm[..., 1]
+    elif num_vecs == 2:
+        LTS, UTE = fm[..., 0], fm[..., 1]
+    else:
+        assert num_vecs == 1, f"unsupported num_vecs={num_vecs}"
+        LTS = fm[..., 0]
+
+    col = np.arange(SKV, dtype=np.int64)
+    causal_end = col - (SKV - S) if causal else np.zeros(SKV, dtype=np.int64)
+    intervals = [
+        (np.zeros(SKV, dtype=np.int64), causal_end),
+        (LTS, LTE),
+        (UTS, UTE),
+    ]
+    intervals = [(np.clip(s, 0, S), np.clip(e, 0, S)) for s, e in intervals]
+
+    def length(s, e):
+        return np.maximum(e - s, 0)
+
+    def intersect(a, b):
+        return np.maximum(a[0], b[0]), np.minimum(a[1], b[1])
+
+    A, Bi, C = intervals
+    masked = (
+        length(*A) + length(*Bi) + length(*C)
+        - length(*intersect(A, Bi)) - length(*intersect(A, C)) - length(*intersect(Bi, C))
+        + length(*intersect(intersect(A, Bi), C))
+    )
+    return masked.sum() / (masked.size * S)
 
 def calculate_tflops(flops: float, time_ms: float, multiplier: int) -> float:
     return multiplier * flops * (1e3 / time_ms) / 1e12
@@ -277,7 +355,11 @@ def test_mask(
     bsp_fwd = block_sparse_tensors(tile_n)[0]
     bsp_bwd = block_sparse_tensors(sparse_tile_n_bwd)[1]
 
-    density, sparsity = compute_density_sparsity(
+    # Reported sparsity: flashmask's element-level count on the flashmask layout of this mask.
+    sparsity = float(flashmask_element_sparsity(causal, mask_info["flashmask"], S, S))
+    density = 1.0 - sparsity
+    # Self-check: the mask_mod FA4 runs (and builds its block masks from) must cover the same set.
+    _, mask_mod_sparsity = compute_density_sparsity(
         flex_mask_mod=flex_mask_mod,
         causal=causal,
         B=B,
@@ -285,11 +367,12 @@ def test_mask(
         M=S,
         N=S,
         tile_m=128,
-        tile_n=128
+        tile_n=128,
+        aux_tensors=mask_info.get("aux_tensors"),
     )
-    if mask_info.get("flashmask_sparsity") is not None:
-        sparsity = mask_info["flashmask_sparsity"]
-        density = 1.0 - sparsity
+    if abs(mask_mod_sparsity - sparsity) > 1e-9:
+        print(f"WARNING: {getattr(flex_mask_mod, '__name__', flex_mask_mod)}: flashmask sparsity "
+              f"{sparsity:.10f} != mask_mod sparsity {mask_mod_sparsity:.10f}")
 
     q = torch.randn(B, S, H, D, device=device, dtype=data_type, requires_grad=True)
     k = torch.randn(B, S, HKV, D, device=device, dtype=data_type, requires_grad=True)
@@ -358,7 +441,7 @@ def test_mask(
 
     return fwd_time_ms, bwd_time_ms, total_time_ms, fwd_flops, bwd_flops, total_flops, fwd_tflops, bwd_tflops, total_tflops, sparsity
 
-def generate_sliding_window(window_size: int):
+def generate_sliding_window(window_size: int, B=16, S=8192, device="cuda"):
 
     def sliding_window(b, h, q_idx, kv_idx):
         return q_idx - kv_idx < window_size
@@ -385,6 +468,9 @@ def generate_sliding_window(window_size: int):
         "flex_mask_mod": sliding_window_mask,
         "aux_tensors": None,
         "causal": True,
+        # benchmark_flashmask.generate_sliding_window_mask: LTS_j = min(j + window, S), causal
+        "flashmask": torch.arange(window_size, S + window_size, device=device, dtype=torch.int32)
+        .clamp(max=S).reshape(1, 1, S, 1).repeat_interleave(B, 0),
     }
 
 def generate_causal_document_mask(B=16, S=8192, doc_seq_lens=[2538, 1742, 3213], device="cuda"):
@@ -425,6 +511,7 @@ def generate_causal_document_mask(B=16, S=8192, doc_seq_lens=[2538, 1742, 3213],
         "flex_mask_mod": causal_document_mask,
         "aux_tensors": [startend_row_indices],
         "causal": True,
+        "flashmask": startend_row_indices[:, None, :, None],  # [B, 1, S, 1] LTS
     }
 
 def generate_document_mask(B=16, S=8192, doc_seq_lens=[2538, 1742, 3213], device="cuda"):
@@ -477,6 +564,8 @@ def generate_document_mask(B=16, S=8192, doc_seq_lens=[2538, 1742, 3213], device
         "flex_mask_mod": document_mask,
         "aux_tensors": [down_left_row_indices, up_right_row_indices],
         "causal": False,
+        # [B, 1, S, 2] (LTS, UTE)
+        "flashmask": torch.stack([down_left_row_indices, up_right_row_indices], dim=-1)[:, None],
     }
 
 def generate_share_question_mask(B=16, S=8192, doc_seq_lens=[2538, 1742, 3213], device="cuda"):
@@ -529,6 +618,7 @@ def generate_share_question_mask(B=16, S=8192, doc_seq_lens=[2538, 1742, 3213], 
         "flex_mask_mod": causal_share_question_mask,
         "aux_tensors": [startend_row_indices],
         "causal": True,
+        "flashmask": startend_row_indices[:, None, :, None],  # [B, 1, S, 1] LTS
     }
 
 def generate_global_sliding_window_mask(B=16, S=8192, global_token=16, window_size=(512, 512), device="cuda"):
@@ -552,11 +642,23 @@ def generate_global_sliding_window_mask(B=16, S=8192, global_token=16, window_si
         global_token_cute = utils.scalar_to_ssa(global_token, cutlass.Int32)
         return ((m_idx >= n_idx) & ((m_idx - n_idx <= (left_window_size_cute)) | (n_idx < global_token_cute))) | ((n_idx >= m_idx) & ((n_idx - m_idx <= (right_window_size_cute)) | (m_idx < global_token_cute)))
 
+    # benchmark_flashmask.generate_global_sliding_window_mask, [B, 1, S, 4] (LTS, LTE, UTS, UTE)
+    lts = torch.arange(left_window_size + 1, S + left_window_size + 1, device=device, dtype=torch.int32).clamp(max=S)
+    lts[:global_token] = 0
+    lte = torch.full([S], S, device=device, dtype=torch.int32)
+    lte[:global_token] = 0
+    uts = torch.full([S], global_token, device=device, dtype=torch.int32)
+    uts[:global_token + right_window_size + 1] = 0
+    ute = torch.arange(-right_window_size, S - right_window_size, device=device, dtype=torch.int32)
+    ute[:global_token + right_window_size + 1] = 0
+    gsw_flashmask = torch.stack([lts, lte, uts, ute], dim=-1).reshape(1, 1, S, 4).repeat_interleave(B, 0)
+
     return {
         "cute_mask_mod": cute_global_sliding_window_mask,
         "flex_mask_mod": global_sliding_window,
         "aux_tensors": None,
         "causal": False,
+        "flashmask": gsw_flashmask,
     }
 
 def generate_causal_blockwise_mask(B=16, S=8192, doc_seq_lens=[2538, 1742, 3213], device="cuda"):
@@ -605,6 +707,8 @@ def generate_causal_blockwise_mask(B=16, S=8192, doc_seq_lens=[2538, 1742, 3213]
         "flex_mask_mod": causal_blockwise_mask,
         "aux_tensors": [start_row_indices, end_row_indices],
         "causal": True,
+        # [B, 1, S, 2] (LTS, LTE)
+        "flashmask": torch.stack([start_row_indices, end_row_indices], dim=-1)[:, None],
     }
 
 def generate_prefix_lm_document_mask(B=16, S=8192, doc_seq_lens=[(1024, 2538), (1742, 1742), (512, 3213)], device="cuda"):
@@ -659,6 +763,8 @@ def generate_prefix_lm_document_mask(B=16, S=8192, doc_seq_lens=[(1024, 2538), (
         "flex_mask_mod": prefix_lm_document_mask,
         "aux_tensors": [down_left_row_indices, up_right_row_indices],
         "causal": False,
+        # [B, 1, S, 2] (LTS, UTE)
+        "flashmask": torch.stack([down_left_row_indices, up_right_row_indices], dim=-1)[:, None],
     }
 
 def generate_prefix_lm_causal_mask(B=16, S=8192, prefix_length=1024, device="cuda"):
@@ -689,6 +795,10 @@ def generate_prefix_lm_causal_mask(B=16, S=8192, prefix_length=1024, device="cud
         "flex_mask_mod": prefix_lm_causal_mask,
         "aux_tensors": [up_right_row_indices],
         "causal": False, # the prefix is bidirectional, same as benchmark_flashmask
+        # [B, 1, S, 2] (LTS = S, i.e. no lower mask, UTE)
+        "flashmask": torch.stack(
+            [torch.full_like(up_right_row_indices, S), up_right_row_indices], dim=-1
+        )[:, None],
     }
 
 def generate_qk_sparse_mask(B=16, S=8192, maskout_pair=[(1024, 538), (2358, 1700)], device="cuda"):
@@ -709,16 +819,6 @@ def generate_qk_sparse_mask(B=16, S=8192, maskout_pair=[(1024, 538), (2358, 1700
     row_indices.extend(list(range(last_offset, S)))
 
     assert len(row_indices) == S, len(row_indices)
-
-    # Sparsity as benchmark_flashmask.flashmask_block_sparsity counts this mask (LT range
-    # [kv_idx, row_indices) under causal): unlike create_block_mask it keeps the diagonal
-    # blocks of a masked-out span, so report the same FLOPs base as flashmask.
-    T = S // 128
-    lt_start_max = np.arange(1, T + 1) * 128 - 1
-    lt_end_min = np.asarray(row_indices).reshape(T, 128).min(-1)
-    i = np.arange(T).reshape(T, 1)
-    skip = (np.arange(T) > i) | ((i * 128 >= lt_start_max) & ((i + 1) * 128 <= lt_end_min))
-    flashmask_sparsity = skip.sum() / (T * T)
 
     row_indices = torch.tensor(row_indices, device=device, dtype=torch.int32).reshape((1, -1)).repeat_interleave(B, 0)
 
@@ -742,7 +842,10 @@ def generate_qk_sparse_mask(B=16, S=8192, maskout_pair=[(1024, 538), (2358, 1700
         "flex_mask_mod": qk_sparse_mask,
         "aux_tensors": [row_indices],
         "causal": True, # Note(umiswing): should this be true?
-        "flashmask_sparsity": flashmask_sparsity,
+        # benchmark_flashmask.generate_qk_sparse_mask: [B, 1, S, 2] (LTS_j = j, LTE_j = row_indices_j)
+        "flashmask": torch.stack(
+            [torch.arange(S, device=device, dtype=torch.int32).expand_as(row_indices), row_indices], dim=-1
+        )[:, None],
     }
 
 
@@ -782,6 +885,7 @@ def generate_random_eviction_mask(B=16, H=16, HKV=16, S=8192, start_row=4096, de
         "flex_mask_mod": causal_random_eviction_mask,
         "aux_tensors": [startend_row_indices],
         "causal": True,
+        "flashmask": startend_row_indices[..., None],  # [B, H, S, 1] LTS, the same random draw
     }
 
 def generate_hybrid_swa_prefix_lm_document_mask(batch_size, seqlen, hkv, d, doc_seq_lens, window_size=512, ratio=3, device="cuda"):
@@ -846,6 +950,7 @@ def generate_hybrid_swa_prefix_lm_document_mask(batch_size, seqlen, hkv, d, doc_
         "flex_mask_mod": hybrid_swa_prefix_lm_document_mask,
         "aux_tensors": [lts, ute],
         "causal": False,
+        "flashmask": torch.stack([lts, ute], dim=-1),  # [B, H, S, 2] (LTS, UTE)
     }
 
 def split_sequence(sequence_length):
@@ -922,9 +1027,9 @@ def main(examples: List[str] = ["all"], dtype='bf16', head_dim=None, current_tim
                 share_qa_docs = [split_sequence(doc_seq) for doc_seq in doc_seq_lens]
 
                 available_examples = {
-                    "Full": lambda: test_mask(mask_info={"cute_mask_mod": None, "flex_mask_mod": None, "aux_tensors": None, "causal": False}, B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Causal": lambda: test_mask(mask_info={"cute_mask_mod": None, "flex_mask_mod": None, "aux_tensors": None, "causal": True}, B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Sliding Window": lambda: test_mask(mask_info=generate_sliding_window(window_size=int(S*0.0625)), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
+                    "Full": lambda: test_mask(mask_info={"cute_mask_mod": None, "flex_mask_mod": None, "aux_tensors": None, "causal": False, "flashmask": None}, B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
+                    "Causal": lambda: test_mask(mask_info={"cute_mask_mod": None, "flex_mask_mod": None, "aux_tensors": None, "causal": True, "flashmask": None}, B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
+                    "Sliding Window": lambda: test_mask(mask_info=generate_sliding_window(window_size=int(S*0.0625), B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
                     "Causal Document Mask": lambda: test_mask(mask_info=generate_causal_document_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
                     # Note(umiswing): FA4 mask_mod will hang in Document Mask, and idk why
                     # "Document Mask": lambda: test_mask(mask_info=generate_document_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),

@@ -39,7 +39,7 @@ def cal_tflops(flops, time_ms):
 # KV shared: k and v are ONE buffer (the MLA convention, v = k[..., :dv]) and the
 # SM100 big-headdim backward merges dK and dV into a single accumulator. The pair
 # list and the detection predicate live in test_util.py so that the benchmark and the
-# tests cannot drift apart (the predicate mirrors flash_mask/cute/interface.py).
+# tests cannot drift apart (the predicate mirrors flashmask/cute/interface.py).
 from test_util import KV_SHARED_D_DV, kv_shared_detected
 
 
@@ -77,22 +77,30 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flu
     else:
         cache = paddle.empty([int(cache_size)], dtype=paddle.int8)
 
-    # Estimate the runtime of the function
+    # Estimate the runtime of the function. One call is enough once it is long (the
+    # first call above already paid for compilation).
     start_event = paddle.device.Event(enable_timing=True)
     end_event = paddle.device.Event(enable_timing=True)
     start_event.record()
-    for _ in range(5):
-        cache.zero_()
-        fn()
+    cache.zero_()
+    fn()
     end_event.record()
     paddle.device.synchronize()
-    estimate_ms = start_event.elapsed_time(end_event) / 5
+    estimate_ms = start_event.elapsed_time(end_event)
+    if estimate_ms <= 50:
+        start_event.record()
+        for _ in range(5):
+            cache.zero_()
+            fn()
+        end_event.record()
+        paddle.device.synchronize()
+        estimate_ms = start_event.elapsed_time(end_event) / 5
 
-    # compute number of warmup and repeat
-    n_warmup = max(1, int(warmup / estimate_ms))
-    n_repeat = max(1, int(rep / estimate_ms))
-    n_warmup = 10
-    n_repeat = 50
+    # Iteration counts from the estimate, like triton's do_bench, clamped: kernels up to
+    # ~20 ms keep 10 warmup + 50 timed runs, long ones (S = 128K, hundreds of ms per
+    # call) drop to 2 + 10, where the per-run jitter is far below 1%.
+    n_warmup = min(10, max(2, int(warmup * 10 / estimate_ms)))
+    n_repeat = min(50, max(10, int(rep * 10 / estimate_ms)))
     start_event = [paddle.device.Event(enable_timing=True) for i in range(n_repeat)]
     end_event = [paddle.device.Event(enable_timing=True) for i in range(n_repeat)]
     # Warm-up
@@ -172,7 +180,7 @@ def test_mask(
 
     startend_row_indices, causal = build_mask()
 
-    sparsity = flashmask_block_sparsity(causal, startend_row_indices, B, H, HKV, S, SKV)
+    sparsity = flashmask_element_sparsity(causal, startend_row_indices, S, SKV)
     density = 1.0 - sparsity
 
     sink = None
@@ -185,7 +193,7 @@ def test_mask(
     use_cutedsl = (backend == 'cutedsl')
 
     if use_cutedsl:
-        from flash_mask.cute.interface import flashmask_attention
+        from flashmask.cute.interface import flashmask_attention
     else:
         from paddle.nn.functional.flash_attention import flashmask_attention
 
@@ -197,7 +205,7 @@ def test_mask(
             # Same leak, and this one hits kv_mode='split' too.
             sink.stop_gradient = True
         def flashmask_fwd():
-            from flash_mask.cute.interface import _flash_attn_fwd
+            from flashmask.cute.interface import _flash_attn_fwd
             out, lse = _flash_attn_fwd(
                 query,
                 key,
@@ -219,8 +227,8 @@ def test_mask(
 
     if use_cutedsl:
         def flashmask_bwd():
-            from flash_mask.cute import flashmask_utils as fm
-            from flash_mask.cute.interface import _flash_attn_bwd
+            from flashmask.cute import flashmask_utils as fm
+            from flashmask.cute.interface import _flash_attn_bwd
             flashmask_info = None
             if startend_row_indices is not None:
                 flashmask_info = fm.FlashMaskInfoPaddle(
@@ -257,134 +265,62 @@ def test_mask(
 
     return fwd_time_ms, bwd_time_ms, total_time_ms, fwd_flops, bwd_flops, total_flops, fwd_tflops, bwd_tflops, total_tflops, sparsity
 
-def flashmask_block_sparsity(
-    causal,
-    flashmask,
-    B=None,
-    H=None,
-    HKV=None,
-    S=None,
-    SKV=None,
-    KV_BLOCK_SIZE=128,
-    Q_BLOCK_SIZE=128,
-    ):
+def flashmask_element_sparsity(causal, flashmask, S, SKV):
+    """Fraction of masked (q, k) elements, independent of the kernel's tile sizes.
 
+    Same convention as FA4's benchmarks: FLOPs = density * dense FLOPs, where density
+    is the exact fraction of visible elements. For key column j the masked rows are the
+    union of [0, j - (SKV - S)) (causal, bottom-right aligned), [LTS_j, LTE_j) and
+    [UTS_j, UTE_j). q heads broadcast uniformly over mask heads, so the ratio over
+    the mask's [B, H_mask] equals the ratio over [B, H].
+    """
     if flashmask is None and not causal:
         return 0.0
-    elif flashmask is None and causal:
-        assert S == SKV
-        Br = Q_BLOCK_SIZE
-        Bc = KV_BLOCK_SIZE
-        Tr = S // Br
-        Tc = SKV // Bc
-        total_size = B * H * S * SKV
-        num_sparse_blocks = Tr * (Tc - 1) // 2 * B * H
-        sparsity = ((num_sparse_blocks * Bc * Br) / total_size)
-        return sparsity
 
-    LTS = None
-    LTE = None
-    UTS = None
-    UTE = None
-    if flashmask.shape[-1] == 4:
-        LTS, LTE, UTS, UTE = flashmask.split(4, axis=-1)
-        LTS = LTS.squeeze(-1)
-        LTE = LTE.squeeze(-1)
-        UTS = UTS.squeeze(-1)
-        UTE = UTE.squeeze(-1)
-    elif flashmask.shape[-1] == 2 and causal:
-        LTS, LTE = flashmask.split(2, axis=-1)
-        LTS = LTS.squeeze(-1)
-        LTE = LTE.squeeze(-1)
-    elif flashmask.shape[-1] == 2 and not causal:
-        LTS, UTE = flashmask.split(2, axis=-1)
-        LTS = LTS.squeeze(-1)
-        UTE = UTE.squeeze(-1)
+    row = np.arange(S, dtype=np.int64)
+    if flashmask is None:
+        visible = np.clip(row + SKV - S + 1, 0, SKV).sum()
+        return 1.0 - visible / (S * SKV)
+
+    fm = flashmask.cpu().detach().numpy().astype(np.int64)
+    assert fm.shape[2] == SKV, f"startend_row_indices seqlen {fm.shape[2]} != SKV {SKV}"
+    num_vecs = fm.shape[-1]
+    zero = np.zeros(fm.shape[:3], dtype=np.int64)
+    full = np.full(fm.shape[:3], S, dtype=np.int64)
+    # Empty intervals [0, 0) for whatever this layout does not carry.
+    LTS, LTE, UTS, UTE = full, full, zero, zero
+    if num_vecs == 4:
+        LTS, LTE, UTS, UTE = fm[..., 0], fm[..., 1], fm[..., 2], fm[..., 3]
+    elif num_vecs == 2 and causal:
+        LTS, LTE = fm[..., 0], fm[..., 1]
+    elif num_vecs == 2:
+        LTS, UTE = fm[..., 0], fm[..., 1]
     else:
-        LTS = flashmask.squeeze(-1)
+        assert num_vecs == 1, f"unsupported num_vecs={num_vecs}"
+        LTS = fm[..., 0]
 
-    Br = Q_BLOCK_SIZE
-    Bc = KV_BLOCK_SIZE
+    col = np.arange(SKV, dtype=np.int64)
+    causal_end = col - (SKV - S) if causal else np.zeros(SKV, dtype=np.int64)
+    intervals = [
+        (np.zeros(SKV, dtype=np.int64), causal_end),
+        (LTS, LTE),
+        (UTS, UTE),
+    ]
+    intervals = [(np.clip(s, 0, S), np.clip(e, 0, S)) for s, e in intervals]
 
-    # Note(umiswing): hack block size to seqlen when seqlen < block size, so the calculation code can reuse.
-    Br = min(Br, S)
-    Bc = min(Bc, SKV)
-    
-    if LTS is not None:
-        B, H_mask, S = LTS.shape
-    if LTE is not None:
-        B, H_mask, S = LTE.shape
-    if UTS is not None:
-        B, H_mask, S = UTS.shape
-    if UTE is not None:
-        B, H_mask, S = UTE.shape
-    
-    Tr = S // Br
-    Tc = SKV // Bc
+    def length(s, e):
+        return np.maximum(e - s, 0)
 
-    if LTS is not None:
-        LTS = LTS.cpu().detach().numpy()
-    else:
-        LTS = np.full((B, H_mask, SKV), S, dtype=np.int32)
-    LTStartMax = np.array(LTS).reshape([B, H_mask, -1, Bc]).max(axis=-1)
-    LTStartMin = np.array(LTS).reshape([B, H_mask, -1, Bc]).min(axis=-1)
+    def intersect(a, b):
+        return np.maximum(a[0], b[0]), np.minimum(a[1], b[1])
 
-    if LTE is not None:
-        LTE = LTE.cpu().detach().numpy()
-    else:
-        LTE = np.full((B, H_mask, SKV), S, dtype=np.int32)
-    LTEndMax = np.array(LTE).reshape([B, H_mask, -1, Bc]).max(-1)
-    LTEndMin = np.array(LTE).reshape([B, H_mask, -1, Bc]).min(-1)
-    
-    if UTS is not None:
-        UTS = UTS.cpu().detach().numpy()
-    else:
-        UTS = np.full((B, H_mask, SKV,), 0, dtype=np.int32)
-    UTStartMax = np.array(UTS).reshape([B, H_mask, -1, Bc]).max(-1)
-    UTStartMin = np.array(UTS).reshape([B, H_mask, -1, Bc]).min(-1)
-
-    if UTE is not None:
-        UTE = UTE.cpu().detach().numpy()
-    else:
-        assert S == SKV
-        UTE = np.tile(np.arange(S, dtype=np.int32).reshape(1, 1, S), (B, H_mask, 1))
-    UTEndMax = np.array(UTE).reshape([B, H_mask, -1, Bc]).max(-1)
-    UTEndMin = np.array(UTE).reshape([B, H_mask, -1, Bc]).min(-1)
-
-    
-    num_dense_blocks = 0
-    for bsz in range(B):
-        for q_head in range(H):
-            head = q_head // (H // H_mask)
-            for i in range(Tr):
-                for j in range(Tc):
-                    if causal and j > i:
-                        #print('S', end="")
-                        continue
-                    if i * Br >= LTStartMax[bsz, head, j] and (i+1) * Br <= LTEndMin[bsz, head, j]:
-                        #print('S', end="")
-                        continue
-                    if i * Br >= UTStartMax[bsz, head, j] and (i+1) * Br <= UTEndMin[bsz, head, j]:
-                        #print('S', end="")
-                        continue
-            
-                    if (i+1) * Br > LTStartMin[bsz, head, j] and i * Br < LTEndMax[bsz, head, j]:
-                        #print('A', end="")
-                        num_dense_blocks += 1
-                        continue
-                    if (i+1) * Br > UTStartMin[bsz, head, j] and i * Br < UTEndMax[bsz, head, j]:
-                        #print('A', end="")
-                        num_dense_blocks += 1
-                        continue
-            
-                    #print('C', end="")
-                    num_dense_blocks += 1
-                #print()
-
-    num_sparse_blocks = B * H * Tc * Tr - num_dense_blocks
-    total_size = B * H * S * SKV
-    sparsity = ((num_sparse_blocks * Bc * Br) / total_size)
-    return sparsity
+    A, Bi, C = intervals
+    masked = (
+        length(*A) + length(*Bi) + length(*C)
+        - length(*intersect(A, Bi)) - length(*intersect(A, C)) - length(*intersect(Bi, C))
+        + length(*intersect(intersect(A, Bi), C))
+    )
+    return masked.sum() / (masked.size * S)
 
 
 def generate_none_mask(B, S, H, D, causal=True):
@@ -402,6 +338,9 @@ def generate_sliding_window_mask(B, S, H, D, window_size=1024):
     return startend_row_indices, causal
 
 def generate_causal_document_mask(B, S, H, D, doc_seq_lens=[2538, 1742, 3213]):
+    # Copy: the padding below must not leak into the caller's list (the other masks
+    # of the same sample share it) or into the default argument.
+    doc_seq_lens = list(doc_seq_lens)
     total_seq_len = np.sum(doc_seq_lens)
     assert total_seq_len <= S
     assert len(doc_seq_lens) >= 1
@@ -786,7 +725,7 @@ def method_name(fm_version, kv_mode):
     return f"flashmaskv{fm_version}" + ("kvshared" if kv_mode == "shared" else "")
 
 
-def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="", overwrite=True, head_dim=None, current_time=None, backend='cutedsl', kv_mode=None, use_sink=False, vs_sparse_attn=False, dedup_static_masks=False):
+def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="", overwrite=True, head_dim=None, current_time=None, backend='cutedsl', kv_mode=None, use_sink=False, vs_sparse_attn=False, dedup_static_masks=False, first_sample_only=False):
     """Run the benchmark with the given examples.
 
     Args:
@@ -814,6 +753,7 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="", o
             the same kernel again. Applies under vs_sparse_attn as well, where it
             leaves ``Causal`` on the first sample and ``Causal Document Mask`` on
             all five.
+        first_sample_only: run only Sample 1 of each ``Total length`` block.
 
     Sequence lengths and document layouts come from kernel_test_seq_info.txt --
     every ``Total length`` block, every sample. Add a case by adding a line
@@ -897,6 +837,13 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="", o
             else:
                 doc_list = eval(line.split(":")[-1].split("#")[0].strip())
                 qksparse_mask = eval(line.split(":")[-1].split("#")[1].strip())
+                # The mask generators pad a short layout, each in its own way, so a
+                # layout that does not cover S silently measures a different mask.
+                doc_total = sum(seq_len for _, seq_len in doc_list)
+                assert doc_total == total_length, (
+                    f"kernel_test_seq_info.txt: documents sum to {doc_total}, "
+                    f"not Total length {total_length}: {line[:60]}"
+                )
                 doc_seq_lens_list.append((total_length, doc_list, qksparse_mask))
         #doc_seq_lens_list = doc_seq_lens_list[::-1]
         # The first sample of each "Total length" block: the one entry per S that
@@ -937,6 +884,8 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="", o
                     continue
 
             for idx, (S, prefix_doc_seq_lens, qksparse_mask) in enumerate(doc_seq_lens_list):
+                if first_sample_only and idx != first_idx_of_S[S]:
+                    continue
                 if vs_sparse_attn:
                     B = 1
                 else:
@@ -949,12 +898,14 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="", o
                 offset = 0
                 print(f"{B}_{S}_{H}_{HKV}_{D}_{DV}_{idx}_{dtype}")
                 if not overwrite:
+                    # Same name as the file written below, so a rerun with the same
+                    # --current_time picks up where a killed run stopped.
                     done = [
-                        os.path.exists(f"{dtype}{suffix}/{method_name(fm_version, m)}_{B}_{S}_{H}_{D}_{DV}_{idx}.csv")
+                        os.path.exists(f"{dtype}{suffix}/{method_name(fm_version, m)}_{current_time}_{B}_{S}_{H}_{HKV}_{D}_{DV}_{idx}.csv")
                         for m in d_kv_modes
                     ]
                     if all(done):
-                        print(f"{dtype}{suffix}/*_{B}_{S}_{H}_{D}_{DV}_{idx}.csv already exists for kv_mode={d_kv_modes}, skipping. To enable overwrite, use: --overwrite (True by default).")
+                        print(f"{dtype}{suffix}/*_{current_time}_{B}_{S}_{H}_{HKV}_{D}_{DV}_{idx}.csv already exists for kv_mode={d_kv_modes}, skipping (--no-overwrite).")
                         continue
                 if sum(qksparse_mask) == 0:
                     maskout_pair = [(1024, 538), (2358, 1700)]
@@ -1014,7 +965,11 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="", o
                     for ex in ex_to_run:
                         if ex in available_examples:
                             print(f"{ex} [kv_mode={mode}]")
+                            t_mask = time.time()
                             fw_time, bw_time, total_time, fw_flops, bw_flops, total_flops, fw_tflops, bw_tflops, total_tflops, sparsity = available_examples[ex](mode)
+                            # Wall clock of the whole mask (compile + mask build + timing runs).
+                            print(f"[time] S={S} D={D} mask={ex} kv_mode={mode} wall={time.time() - t_mask:.1f}s "
+                                  f"(fwd {fw_time:.2f} ms, bwd {bw_time:.2f} ms)")
                             results.append([ex, f"{fw_time:.4f}", f"{bw_time:.4f}", f"{total_time:.4f}", f"{fw_flops:.4f}", f"{bw_flops:.4f}", f"{total_flops:.4f}", f"{fw_tflops:.4f}", f"{bw_tflops:.4f}", f"{total_tflops:4f}", f"{sparsity:.4f}"])
                         else:
                             print(f"Warning: Unknown example key '{ex}'. Skipping.")
@@ -1059,9 +1014,11 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         default=["all"],
-        help="List of examples to run. Use space to separate multiple examples. "
-        "Available options: causal, alibi, sliding_window, prefix_lm, "
-        "document, softcap, softcap_approx, or 'all' to run all examples.",
+        help="Masks to run, or 'all'. Names as in the CSV Operation column: "
+        "'Full', 'Causal', 'Sliding Window', 'Global Sliding Window', "
+        "'Causal Document Mask', 'Document Mask', 'Share Question Mask', "
+        "'Causal Blockwise Mask', 'Prefix LM Document Mask', 'Prefix LM Causal Mask', "
+        "'QK-sparse Mask', 'Random Eviction Mask'.",
     )
     parser.add_argument(
         "--dtype",
@@ -1109,29 +1066,28 @@ if __name__ == "__main__":
         "Left unset, --vs_sparse_attn picks 'shared' and everything else 'split'.",
     )
 
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument("--overwrite", action="store_true", default=True)
-    group.add_argument("--no-overwrite", action="store_false", dest="overwrite")
+    parser.add_argument(
+        "--no-overwrite",
+        action="store_false",
+        dest="overwrite",
+        help="Skip the samples whose CSVs for this --current_time already exist "
+        "(resume a killed run by passing its --current_time again).",
+    )
 
-    sink_group = parser.add_mutually_exclusive_group()
-    sink_group.add_argument(
+    parser.add_argument(
         "--use_sink",
         action="store_true",
         default=False,
         help="Add the learnable per-head attention sink (the online latent-MQA "
         "layers carry one when add_full_attention_sink_bias is set).",
     )
-    sink_group.add_argument("--no-use_sink", action="store_false", dest="use_sink")
 
     parser.add_argument(
         "--vs_sparse_attn",
         action="store_true",
         default=False,
-        help="Only measure what benchmark_flashmla_sparse_attn.py can be "
-        "compared against: the Causal and Causal Document Mask operations, at "
-        "that kernel's shapes (head_dim 576, 64 query heads, 1 KV head, "
-        "kv_mode shared). An explicit --head_dim or --kv_mode still wins. "
-        "Without this flag every mask is measured, as before.",
+        help="Only measure Causal and Causal Document Mask at the shapes of "
+        "benchmark_flashmla_sparse_attn.py (head_dim 576, H=64, HKV=1, kv_mode shared).",
     )
 
     parser.add_argument(
@@ -1145,6 +1101,13 @@ if __name__ == "__main__":
         "layout, so for these masks the extra runs re-measure the same kernel. "
         "Applies under --vs_sparse_attn too, where only Causal Document Mask is "
         "then left on the later samples.",
+    )
+
+    parser.add_argument(
+        "--first_sample_only",
+        action="store_true",
+        default=False,
+        help="Run only Sample 1 of each 'Total length' block of kernel_test_seq_info.txt.",
     )
 
     args = parser.parse_args()
