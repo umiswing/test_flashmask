@@ -4,3 +4,4 @@
 *.pdf
 *.ncu-rep
 __pycache__/*
+parallel_logs/*
