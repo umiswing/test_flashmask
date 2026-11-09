@@ -6,31 +6,32 @@ def startend_row_indices_to_attn_bias(startend_row_indices, seqlen_q, nheads, dt
         return None
     bz, num_head, seqlen_k, bound_num = startend_row_indices.shape
     assert nheads % num_head == 0
-    m = paddle.zeros((bz, num_head, seqlen_q, seqlen_k), dtype=dtype)
     has_end = (causal and bound_num == 2) or ((not causal) and bound_num == 4)
-    for bi in range(bz):
-        for hi in range(num_head):
-            for j in range(seqlen_k):
-                downstart = startend_row_indices[bi, hi, j, 0]
-                if has_end:
-                    downend = startend_row_indices[bi, hi, j, 1]
-                    m[bi, hi, downstart:downend, j] = -np.inf
-                else:
-                    m[bi, hi, downstart:, j] = -np.inf
-                if causal:
-                    # from flash-attention 2.1 and in flash-attention 3, If seqlen_q != seqlen_k and causal=True,
-                    # the causal mask is aligned to the bottom right corner of the attention matrix,
-                    # instead of the top-left corner.
-                    # See: https://github.com/Dao-AILab/flash-attention?tab=readme-ov-file#21-change-behavior-of-causal-flag
-                    m[bi, hi, :max(0, j - (seqlen_k - seqlen_q)), j] = -np.inf
-                else:
-                    if has_end:
-                        upstart = startend_row_indices[bi, hi, j, 2]
-                        upend = startend_row_indices[bi, hi, j, 3]
-                        m[bi, hi, upstart:upend, j] = -np.inf
-                    else:
-                        upend = startend_row_indices[bi, hi, j, 1]
-                        m[bi, hi, :upend, j] = -np.inf
+    # Vectorized: row i of key column j is masked when it falls in one of the column's
+    # [start, end) row ranges. Bounds are non-negative, so this matches slicing m[start:end, j].
+    sri = startend_row_indices.astype(paddle.int64)
+    row = paddle.arange(seqlen_q, dtype=paddle.int64).reshape([1, 1, seqlen_q, 1])
+    col = lambda c: sri[:, :, :, c].unsqueeze(2)  # (b, h, 1, sk)
+    if has_end:
+        masked = (row >= col(0)) & (row < col(1))
+    else:
+        masked = row >= col(0)
+    if causal:
+        # from flash-attention 2.1 and in flash-attention 3, If seqlen_q != seqlen_k and causal=True,
+        # the causal mask is aligned to the bottom right corner of the attention matrix,
+        # instead of the top-left corner.
+        # See: https://github.com/Dao-AILab/flash-attention?tab=readme-ov-file#21-change-behavior-of-causal-flag
+        j = paddle.arange(seqlen_k, dtype=paddle.int64).reshape([1, 1, 1, seqlen_k])
+        masked = masked | (row < j - (seqlen_k - seqlen_q))
+    elif has_end:
+        masked = masked | ((row >= col(2)) & (row < col(3)))
+    else:
+        masked = masked | (row < col(1))
+    m = paddle.where(
+        masked,
+        paddle.full(masked.shape, -np.inf, dtype=dtype),
+        paddle.zeros(masked.shape, dtype=dtype),
+    )
     m = paddle.repeat_interleave(x=m, repeats=nheads // num_head, axis=1)
     return m
 

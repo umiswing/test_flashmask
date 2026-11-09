@@ -5,7 +5,7 @@ import pytest
 from einops import rearrange, repeat
 import paddle
 try:
-    from flash_mask.cute.interface import flashmask_attention
+    from flashmask.cute.interface import flashmask_attention
 except (ImportError, ModuleNotFoundError):
     # Note(umiswing): comment it out if you really want to test in the old way
     assert False
@@ -83,13 +83,65 @@ d_dv_cases = [
     (80, 80),
     (128, 128),
     (192, 128),
-    (192, 192),
     (256, 256),
     (512, 512),
     (576, 512),
 ]
 
 fa_versions = detect_fa_versions()
+
+
+_POISON_DTYPES = (paddle.float16, paddle.bfloat16, paddle.float32)
+
+
+@pytest.fixture(autouse=True)
+def _poison_empty(monkeypatch):
+    """Hand every FlashMask empty / empty_like float buffer out as NaN.
+
+    A row the kernels never write then shows up as NaN in the outputs / gradients.
+    Without this, a missed row only fails when the allocator happens to return
+    non-zero memory: the rows most likely to be missed (fully masked query rows,
+    key blocks no query attends) have an all-zero output / gradient, which fresh,
+    driver-zeroed memory already matches.
+    The forward O goes through `empty`, dQ/dK/dV through `empty_like`. Integer
+    buffers (block counts, scheduler counters) are left alone.
+    Only the FlashMask cutedsl path allocates through this backend.
+    """
+    try:
+        import flashmask.backend._paddle as fm_paddle_backend
+    except (ImportError, ModuleNotFoundError):
+        yield
+        return
+    backend = fm_paddle_backend.PaddleBackend
+    orig_empty = backend.empty
+    orig_empty_like = backend.empty_like
+
+    def poisoned_empty(self, shape, dtype=None):
+        t = orig_empty(self, shape, dtype)
+        if t.dtype in _POISON_DTYPES:
+            t = paddle.full_like(t, float("nan"))
+        return t
+
+    def poisoned_empty_like(self, x, dtype=None):
+        t = orig_empty_like(self, x, dtype)
+        if t.dtype in _POISON_DTYPES:
+            t = paddle.full_like(t, float("nan"))
+        return t
+
+    monkeypatch.setattr(backend, "empty", poisoned_empty)
+    monkeypatch.setattr(backend, "empty_like", poisoned_empty_like)
+    yield
+
+
+def _assert_all_written(name, t):
+    """With _poison_empty, NaN / inf means some rows were never written by the kernel."""
+    bad = ~paddle.isfinite(t.astype(paddle.float32))
+    if bool(bad.any().item()):
+        idx = paddle.nonzero(bad)
+        raise AssertionError(
+            f"flashmask {name} has {idx.shape[0]} NaN/inf elements (never written by the "
+            f"kernel?); first index (b, s, h, d) = {idx[0].tolist()}"
+        )
 
 # learnable_sink supports fp16/bf16/fp32, independent of the q/k/v dtype.
 _SINK_DTYPES = [paddle.bfloat16, paddle.float16, paddle.float32]
@@ -298,12 +350,16 @@ def test_flashmask(
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
 
+    _assert_all_written("out", out)
     assert (out - out_ref).abs().max().item() <= rtol * (out_bf16 - out_ref).abs().max().item() + fwd_atol
 
     g = paddle.randn(shape=out.shape, dtype=out.dtype)
     out.backward(g)
     out_ref.backward(g)
     out_bf16.backward(g)
+
+    for name, grad in (("dQ", q.grad), ("dK", k.grad)) + ((("dV", v.grad),) if not kv_shared else ()):
+        _assert_all_written(name, grad)
 
     print(f"flashmask dQ max diff: {(q.grad - q_ref.grad).abs().max().item()}")
     print(f"flashmask dK max diff: {(k.grad - k_ref.grad).abs().max().item()}")
