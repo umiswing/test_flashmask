@@ -1,3 +1,4 @@
+import contextlib
 import json
 import numpy as np
 from functools import partial
@@ -10,18 +11,8 @@ import os
 import gc
 from datetime import datetime
 
-np.random.seed(0)
-random.seed(0)
+import bench_common
 
-def _summarize_statistics(times, quantiles, return_mode):
-    if quantiles is not None:
-        ret = paddle.quantile(times, paddle.to_tensor(quantiles, dtype=paddle.float32)).tolist()
-        if len(ret) == 1:
-            ret = ret[0]
-        return ret
-    if return_mode == "all":
-        return times.tolist()
-    return getattr(paddle, return_mode)(times).item()
 
 def cal_flops(B, H, Sq, Sk, D, DV, mode='fwd'):
     assert mode in ["fwd", "bwd", "fwd_bwd"]
@@ -43,94 +34,64 @@ def cal_tflops(flops, time_ms):
 from test_util import KV_SHARED_D_DV, kv_shared_detected
 
 
-def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean"):
-    """
-    Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
-    the 20-th and 80-th performance percentile.
+def do_bench(fn, S):
+    return bench_common.do_bench(fn, S, paddle.device.synchronize, paddle.device.Event)
 
-    :param fn: Function to benchmark
-    :type fn: Callable
-    :param warmup: Warmup time (in ms)
-    :type warmup: int
-    :param rep: Repetition time (in ms)
-    :type rep: int
-    :param grad_to_none: Reset the gradient of the provided tensor to None
-    :type grad_to_none: torch.tensor, optional
-    :param quantiles: Performance percentile to return in addition to the median.
-    :type quantiles: list[float], optional
-    :param fast_flush: Use faster kernel to flush L2 cache between measurements
-    :type fast_flush: bool, default is True
-    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all" Default is "mean".    :type return_mode: str
-    """
-    assert return_mode in ["min", "max", "mean", "median", "all"]
 
-    fn()
+def flashmask_bwd_call(query, key, value, out, gradOut, lse, startend_row_indices, causal, sink):
+    """The cutedsl backward that is timed; returns (dq, dk, dv, dsink)."""
+    from flashmask.cute import flashmask_utils as fm
+    from flashmask.cute.interface import _flash_attn_bwd
+    flashmask_info = None
+    if startend_row_indices is not None:
+        flashmask_info = fm.FlashMaskInfoPaddle(
+            startend_row_indices=startend_row_indices,
+            is_causal=causal,
+        )
+    return _flash_attn_bwd(
+        query,
+        key,
+        value,
+        out,
+        gradOut,
+        lse,
+        flashmask_info,
+        causal=causal,
+        learnable_sink=sink,
+    )
 
-    paddle.device.synchronize()
 
-    # We maintain a buffer of 256 MB that we clear
-    # before each kernel call to make sure that the L2 cache
-    # doesn't contain any input data before the run
-    cache_size = 256 * 1024 * 1024
-    if fast_flush:
-        cache = paddle.empty([int(cache_size // 4)], dtype=paddle.int32)
-    else:
-        cache = paddle.empty([int(cache_size)], dtype=paddle.int8)
+@contextlib.contextmanager
+def _poison_empty():
+    """FlashMask empty / empty_like float buffers as NaN (see test_flashmask.py), so an
+    output row the kernels never write shows up in the --check_masks output check.
+    Older flashmask builds without flashmask.backend run unpoisoned (a warning says so)."""
+    try:
+        import flashmask.backend._paddle as fm_paddle_backend
+    except ImportError:
+        print("[acc] flashmask.backend._paddle not found: outputs are not NaN-poisoned")
+        yield
+        return
+    backend = fm_paddle_backend.PaddleBackend
+    orig_empty, orig_empty_like = backend.empty, backend.empty_like
 
-    # Estimate the runtime of the function. One call is enough once it is long (the
-    # first call above already paid for compilation).
-    start_event = paddle.device.Event(enable_timing=True)
-    end_event = paddle.device.Event(enable_timing=True)
-    start_event.record()
-    cache.zero_()
-    fn()
-    end_event.record()
-    paddle.device.synchronize()
-    estimate_ms = start_event.elapsed_time(end_event)
-    if estimate_ms <= 50:
-        start_event.record()
-        for _ in range(5):
-            cache.zero_()
-            fn()
-        end_event.record()
-        paddle.device.synchronize()
-        estimate_ms = start_event.elapsed_time(end_event) / 5
+    def poisoned(f):
+        def g(self, *args, **kwargs):
+            t = f(self, *args, **kwargs)
+            if t.dtype in (paddle.float16, paddle.bfloat16, paddle.float32):
+                t = paddle.full_like(t, float("nan"))
+            return t
+        return g
 
-    # Iteration counts from the estimate, like triton's do_bench, clamped: kernels up to
-    # ~20 ms keep 10 warmup + 50 timed runs, long ones (S = 128K, hundreds of ms per
-    # call) drop to 2 + 10, where the per-run jitter is far below 1%.
-    n_warmup = min(10, max(2, int(warmup * 10 / estimate_ms)))
-    n_repeat = min(50, max(10, int(rep * 10 / estimate_ms)))
-    start_event = [paddle.device.Event(enable_timing=True) for i in range(n_repeat)]
-    end_event = [paddle.device.Event(enable_timing=True) for i in range(n_repeat)]
-    # Warm-up
-    for _ in range(n_warmup):
-        fn()
-    # Benchmark
+    backend.empty, backend.empty_like = poisoned(orig_empty), poisoned(orig_empty_like)
+    try:
+        yield
+    finally:
+        backend.empty, backend.empty_like = orig_empty, orig_empty_like
 
-    gc.collect()
-    gc.disable()
-    for i in range(n_repeat):
-        # we don't want `fn` to accumulate gradient values
-        # if it contains a backward pass. So we clear the
-        # provided gradients
-        if grad_to_none is not None:
-            for x in grad_to_none:
-                x.grad = None
-        # we clear the L2 cache before each run
-        #cache.zero_()
-        # record time of `fn`
-        start_event[i].record()
-        fn()
-        end_event[i].record()
-    gc.enable()
-    # Record clocks
-    paddle.device.synchronize()
-    times = paddle.to_tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=paddle.float32)
-    return _summarize_statistics(times, quantiles, return_mode)
 
 def test_mask(
-    generate_mask_fn,
+    spec,
     B,
     S,
     SKV,
@@ -142,45 +103,55 @@ def test_mask(
     use_sink = False,
     backend = 'cutedsl',
     kv_mode = 'split',
+    inputs = None,
+    outputs_only = False,
 ):
+    """Time the fwd / bwd of one mask, or with outputs_only run them once on inputs
+    (numpy q, k, v, dout from bench_common.acc_inputs) and return the outputs."""
 
     if dtype == 'bf16':
         data_type = paddle.bfloat16
     else:
         data_type = paddle.float16
 
-    query = paddle.randn([B, S, H, D], dtype=data_type)
-    key = paddle.randn([B, SKV, HKV, D], dtype=data_type)
-    query.stop_gradient = False
-    key.stop_gradient = False
+    if inputs is not None:
+        query, key, value, gradOut = [paddle.to_tensor(x).astype(data_type) for x in inputs]
+        key.stop_gradient = False
+        query.stop_gradient = False
+    else:
+        query = paddle.randn([B, S, H, D], dtype=data_type)
+        key = paddle.randn([B, SKV, HKV, D], dtype=data_type)
+        query.stop_gradient = False
+        key.stop_gradient = False
     if kv_mode == 'shared':
         # The MLA call convention: one D-wide latent buffer is K, and V is its
         # leading DV columns as a stride-1 view. That aliasing is what the
         # backward detects to merge dK and dV into one accumulator. The view is
         # taken after stop_gradient is cleared so K stays the only leaf.
         value = key[..., :DV]
-    else:
+    elif inputs is None:
         value = paddle.randn([B, SKV, HKV, DV], dtype=data_type)
+        value.stop_gradient = False
+    else:
         value.stop_gradient = False
     assert kv_shared_detected(key, value) == (kv_mode == 'shared'), (
         f"kv_mode={kv_mode!r} but the kernel would detect "
         f"kv_shared={kv_shared_detected(key, value)}"
     )
-    gradOut = paddle.randn([B, S, H, DV], dtype=data_type)
+    if inputs is None:
+        gradOut = paddle.randn([B, S, H, DV], dtype=data_type)
 
     # startend_row_indices is a given (the layer already has it) and flashmask
     # consumes it as-is, so there is no mask-conversion step to report here.
     # Building it below is test-data setup, not a cost the kernel imposes. The
     # competitor benchmarks time exactly the step this path does not have:
     # startend_row_indices -> the mask their kernel needs.
-    def build_mask():
-        if generate_mask_fn is None:
-            return None, True
-        return generate_mask_fn(B, SKV, HKV, D)
+    causal = spec.causal
+    startend_row_indices = (
+        None if spec.startend is None else paddle.to_tensor(spec.startend, dtype=paddle.int32)
+    )
 
-    startend_row_indices, causal = build_mask()
-
-    sparsity = flashmask_element_sparsity(causal, startend_row_indices, S, SKV)
+    sparsity = bench_common.element_sparsity(causal, spec.startend, S, SKV)
     density = 1.0 - sparsity
 
     sink = None
@@ -217,41 +188,36 @@ def test_mask(
                 pack_gqa=False,
                 learnable_sink=sink,
             )
-        # paddle.base.core.nvprof_nvtx_push("flashmask")
-        fwd_time_ms = do_bench(flashmask_fwd)
-        # paddle.base.core.nvprof_nvtx_pop()
+            return out, lse
+        if not outputs_only:
+            # paddle.base.core.nvprof_nvtx_push("flashmask")
+            fwd_time_ms = do_bench(flashmask_fwd, S)
+            # paddle.base.core.nvprof_nvtx_pop()
     else:
-        fwd_time_ms = do_bench(flashmask)
+        assert not outputs_only, "outputs_only runs the cutedsl fwd / bwd that is timed"
+        fwd_time_ms = do_bench(flashmask, S)
+
+    if outputs_only:
+        # The timed fwd / bwd calls, once, with every float buffer they allocate NaN.
+        with _poison_empty():
+            flashmask_out, lse = flashmask_fwd()
+            dq, dk, dv, _ = flashmask_bwd_call(query, key, value, flashmask_out, gradOut, lse,
+                                               startend_row_indices, causal, sink)
+        return {n: t.astype(paddle.float32).numpy()
+                for n, t in zip(bench_common.ACC_TENSORS, (flashmask_out, dq, dk, dv))}
 
     flashmask_out, lse = flashmask()
 
     if use_cutedsl:
         def flashmask_bwd():
-            from flashmask.cute import flashmask_utils as fm
-            from flashmask.cute.interface import _flash_attn_bwd
-            flashmask_info = None
-            if startend_row_indices is not None:
-                flashmask_info = fm.FlashMaskInfoPaddle(
-                    startend_row_indices=startend_row_indices,
-                    is_causal=causal,
-                )
-            fm4_query_grad, fm4_key_grad, fm4_value_grad, _ = _flash_attn_bwd(
-                query,
-                key,
-                value,
-                flashmask_out,
-                gradOut,
-                lse,
-                flashmask_info,
-                causal=causal,
-                learnable_sink=sink,
-            )
+            flashmask_bwd_call(query, key, value, flashmask_out, gradOut, lse,
+                               startend_row_indices, causal, sink)
 
         # paddle.base.core.nvprof_nvtx_push("flashmask")
-        bwd_time_ms = do_bench(flashmask_bwd)
+        bwd_time_ms = do_bench(flashmask_bwd, S)
         # paddle.base.core.nvprof_nvtx_pop()
     else:
-        bwd_time_ms = do_bench(lambda: flashmask_out.backward(gradOut, retain_graph=True))
+        bwd_time_ms = do_bench(lambda: flashmask_out.backward(gradOut, retain_graph=True), S)
 
     total_time_ms = fwd_time_ms + bwd_time_ms
 
@@ -265,303 +231,19 @@ def test_mask(
 
     return fwd_time_ms, bwd_time_ms, total_time_ms, fwd_flops, bwd_flops, total_flops, fwd_tflops, bwd_tflops, total_tflops, sparsity
 
-def flashmask_element_sparsity(causal, flashmask, S, SKV):
-    """Fraction of masked (q, k) elements, independent of the kernel's tile sizes.
-
-    Same convention as FA4's benchmarks: FLOPs = density * dense FLOPs, where density
-    is the exact fraction of visible elements. For key column j the masked rows are the
-    union of [0, j - (SKV - S)) (causal, bottom-right aligned), [LTS_j, LTE_j) and
-    [UTS_j, UTE_j). q heads broadcast uniformly over mask heads, so the ratio over
-    the mask's [B, H_mask] equals the ratio over [B, H].
-    """
-    if flashmask is None and not causal:
-        return 0.0
-
-    row = np.arange(S, dtype=np.int64)
-    if flashmask is None:
-        visible = np.clip(row + SKV - S + 1, 0, SKV).sum()
-        return 1.0 - visible / (S * SKV)
-
-    fm = flashmask.cpu().detach().numpy().astype(np.int64)
-    assert fm.shape[2] == SKV, f"startend_row_indices seqlen {fm.shape[2]} != SKV {SKV}"
-    num_vecs = fm.shape[-1]
-    zero = np.zeros(fm.shape[:3], dtype=np.int64)
-    full = np.full(fm.shape[:3], S, dtype=np.int64)
-    # Empty intervals [0, 0) for whatever this layout does not carry.
-    LTS, LTE, UTS, UTE = full, full, zero, zero
-    if num_vecs == 4:
-        LTS, LTE, UTS, UTE = fm[..., 0], fm[..., 1], fm[..., 2], fm[..., 3]
-    elif num_vecs == 2 and causal:
-        LTS, LTE = fm[..., 0], fm[..., 1]
-    elif num_vecs == 2:
-        LTS, UTE = fm[..., 0], fm[..., 1]
-    else:
-        assert num_vecs == 1, f"unsupported num_vecs={num_vecs}"
-        LTS = fm[..., 0]
-
-    col = np.arange(SKV, dtype=np.int64)
-    causal_end = col - (SKV - S) if causal else np.zeros(SKV, dtype=np.int64)
-    intervals = [
-        (np.zeros(SKV, dtype=np.int64), causal_end),
-        (LTS, LTE),
-        (UTS, UTE),
-    ]
-    intervals = [(np.clip(s, 0, S), np.clip(e, 0, S)) for s, e in intervals]
-
-    def length(s, e):
-        return np.maximum(e - s, 0)
-
-    def intersect(a, b):
-        return np.maximum(a[0], b[0]), np.minimum(a[1], b[1])
-
-    A, Bi, C = intervals
-    masked = (
-        length(*A) + length(*Bi) + length(*C)
-        - length(*intersect(A, Bi)) - length(*intersect(A, C)) - length(*intersect(Bi, C))
-        + length(*intersect(intersect(A, Bi), C))
-    )
-    return masked.sum() / (masked.size * S)
 
 
-def generate_none_mask(B, S, H, D, causal=True):
-    return None, causal
-
-def generate_sliding_window_mask(B, S, H, D, window_size=1024):
-    startend_row_indices = paddle.arange(
-        window_size, S + window_size, dtype="int32"
-    ).reshape((1, 1, S, 1))
-    startend_row_indices = paddle.clip(
-        startend_row_indices, max=S
-    ).repeat_interleave(B, 0)
-
-    causal=True
-    return startend_row_indices, causal
-
-def generate_causal_document_mask(B, S, H, D, doc_seq_lens=[2538, 1742, 3213]):
-    # Copy: the padding below must not leak into the caller's list (the other masks
-    # of the same sample share it) or into the default argument.
-    doc_seq_lens = list(doc_seq_lens)
-    total_seq_len = np.sum(doc_seq_lens)
-    assert total_seq_len <= S
-    assert len(doc_seq_lens) >= 1
-    padding = S - np.sum(doc_seq_lens)
-    doc_seq_lens[-1] += padding
-    seq_cusums = np.cumsum(doc_seq_lens)
-
-    startend_row_indices = np.repeat(seq_cusums, doc_seq_lens)
-    startend_row_indices = paddle.to_tensor(startend_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-    
-    causal = True
-    return startend_row_indices, causal
 
 
-def generate_document_mask(B, S, H, D, doc_seq_lens=[2538, 1742, 3213]):
-    total_seq_len = np.sum(doc_seq_lens)
-    assert total_seq_len <= S
-    assert len(doc_seq_lens) >= 1
-    padding = S - np.sum(doc_seq_lens)
 
-    down_left_row_indices = []
-    up_right_row_indices = []
 
-    cur_len_so_far = doc_seq_lens[0]
-    for i in range(len(doc_seq_lens)):
-        down_left_row_indices.extend([cur_len_so_far] * doc_seq_lens[i])
-        if i < len(doc_seq_lens) -1:
-            cur_len_so_far += doc_seq_lens[i+1]
-    if padding > 0:
-        down_left_row_indices.extend([cur_len_so_far] * padding)
 
-    cur_len_so_far = 0
-    for i in range(len(doc_seq_lens)):
-        up_right_row_indices.extend([cur_len_so_far] * doc_seq_lens[i])
-        if i < len(doc_seq_lens) -1:
-            cur_len_so_far += doc_seq_lens[i]
-    if padding > 0:
-        up_right_row_indices.extend([cur_len_so_far] * padding)
-    
-    down_left_row_indices = paddle.to_tensor(down_left_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-    up_right_row_indices = paddle.to_tensor(up_right_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-    startend_row_indices = paddle.concat([down_left_row_indices, up_right_row_indices], axis=-1)
-    
-    causal = False
-    return startend_row_indices, causal
 
-def generate_share_question_mask(B, S, H, D, doc_seq_lens=[2538, 1742, 3213]):
 
-    total_seq_len = sum([sum(doc) for doc in doc_seq_lens])
-    assert total_seq_len <= S
-    assert len(doc_seq_lens) >= 1
-    padding = S - total_seq_len
-    if padding > 0:
-        doc_seq_lens.append([padding])
 
-    startend_row_indices = []
-    seqlen_so_far = 0
-    for doc in doc_seq_lens:
-        assert len(doc) >= 1
-        doc_len = sum(doc)
-        for idx, seqlen in enumerate(doc):
-            if idx == 0:
-                startend_row_indices.extend([seqlen_so_far + doc_len] * doc[idx])
-            else:
-                startend_row_indices.extend([seqlen_so_far + seqlen] * doc[idx])
-            seqlen_so_far += seqlen
 
-    assert seqlen_so_far == S
 
-    startend_row_indices = paddle.to_tensor(startend_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-    
-    causal = True
-    return startend_row_indices, causal
 
-def generate_global_sliding_window_mask(B, S, H, D, global_token=16, window_size=(512, 512)):
-    assert len(window_size) == 2
-    left_window_size, right_window_size = window_size
-
-    down_left_start_row_indices = []
-    down_left_end_row_indices = []
-    up_right_start_row_indices = []
-    up_right_end_row_indices = []
-
-    down_left_start_row_indices = paddle.arange(
-        left_window_size + 1, S + left_window_size + 1, dtype="int32"
-    ).clip(max=S)
-    down_left_start_row_indices[:global_token] = 0
-    down_left_start_row_indices = down_left_start_row_indices.reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-
-    down_left_end_row_indices = paddle.full([S], S, dtype="int32")
-    down_left_end_row_indices[:global_token] = 0
-    down_left_end_row_indices = down_left_end_row_indices.reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-
-    up_right_start_row_indices = paddle.full([S], global_token, dtype="int32")
-    up_right_start_row_indices[:global_token+right_window_size+1] = 0
-    up_right_start_row_indices = up_right_start_row_indices.reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-
-    up_right_end_row_indices = paddle.arange(
-        -right_window_size, S - right_window_size, dtype="int32"
-    )
-    up_right_end_row_indices[:global_token+right_window_size+1] = 0
-    up_right_end_row_indices = up_right_end_row_indices.reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-
-    startend_row_indices = paddle.concat([down_left_start_row_indices, down_left_end_row_indices, up_right_start_row_indices, up_right_end_row_indices], axis=-1)
-
-    causal = False
-    return startend_row_indices, causal
-
-def generate_causal_blockwise_mask(B, S, H, D, doc_seq_lens=[2538, 1742, 3213]):
-    total_seq_len = np.sum(doc_seq_lens)
-    assert total_seq_len <= S
-    assert len(doc_seq_lens) >= 3
-    padding = S - np.sum(doc_seq_lens)
-
-    start_row_indices = []
-    cur_len_so_far = doc_seq_lens[0]
-    for i in range(len(doc_seq_lens)):
-        start_row_indices.extend([cur_len_so_far] * doc_seq_lens[i])
-        if i < len(doc_seq_lens) - 1:
-            cur_len_so_far += doc_seq_lens[i+1]
-    if padding > 0:
-        start_row_indices.extend([cur_len_so_far] * padding)
-    start_row_indices = paddle.to_tensor(start_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-
-    seq_cusums = np.cumsum(doc_seq_lens)
-    end_row_indices = [seq_cusums[-2]] * seq_cusums[-2] + [seq_cusums[-1]] * doc_seq_lens[-1] + [S] * padding
-    end_row_indices = paddle.to_tensor(end_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-
-    startend_row_indices = paddle.concat([start_row_indices, end_row_indices], axis=-1)
-
-    causal = True
-    return startend_row_indices, causal
-
-def generate_prefix_lm_document_mask(B, S, H, D, doc_seq_lens=[(1024, 2538), (1742, 1742), (512, 3213)]):
-    """
-    tuple(prefix_length, seq_length)
-    """
-    assert len(doc_seq_lens) >= 2
-    total_seq_len = 0
-    for prefix_length, seq_length in doc_seq_lens:
-        total_seq_len += seq_length
-    assert total_seq_len <= S
-    padding = S - total_seq_len
-
-    down_left_row_indices = []
-    cur_len_so_far = doc_seq_lens[0][1]
-    for i in range(len(doc_seq_lens)):
-        down_left_row_indices.extend([cur_len_so_far] * doc_seq_lens[i][1])
-        if i < len(doc_seq_lens) - 1:
-            cur_len_so_far += doc_seq_lens[i+1][1]
-    if padding > 0:
-        down_left_row_indices.extend([cur_len_so_far] * padding)
-    down_left_row_indices = paddle.to_tensor(down_left_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-
-    up_right_row_indices = []
-    cur_len_so_far = 0
-    for prefix_length, seq_length in doc_seq_lens:
-        up_right_row_indices.extend([cur_len_so_far] * prefix_length + list(range(cur_len_so_far+prefix_length, cur_len_so_far+seq_length)))
-        cur_len_so_far += seq_length
-    if padding > 0:
-        up_right_row_indices.extend([total_seq_len] * padding)
-    up_right_row_indices = paddle.to_tensor(up_right_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-
-    startend_row_indices = paddle.concat([down_left_row_indices, up_right_row_indices], axis=-1)
-
-    causal = False
-    return startend_row_indices, causal
-
-def generate_prefix_lm_causal_mask(B, S, H, D, prefix_length=1024):
-    """
-    tuple(prefix_length, seq_length)
-    """
-    assert prefix_length <= S
-    down_left_row_indices = paddle.full([S], S, dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-    up_right_row_indices = paddle.to_tensor([0] * prefix_length + list(range(prefix_length, S)), dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-    startend_row_indices = paddle.concat([down_left_row_indices, up_right_row_indices], axis=-1)
-
-    causal = False
-    return startend_row_indices, causal
-
-def generate_qk_sparse_mask(B, S, H, D, maskout_pair=[(1024, 538), (2358, 1700)]):
-    """
-    tuple(offset, maskout_len)
-    """
-    start_row_indices = []
-    end_row_indices  = []
-    last_offset = 0
-    for offset, maskout_len in maskout_pair:
-        assert offset >= last_offset
-        start_row_indices.extend(list(range(last_offset, offset)))
-        end_row_indices.extend(list(range(last_offset, offset)))
-
-        start_row_indices.extend(list(range(offset, offset+maskout_len)))
-        end_row_indices.extend([offset+maskout_len]*(maskout_len))
-
-        last_offset = offset + maskout_len
-
-    last_offset <= S
-    start_row_indices.extend(list(range(last_offset, S)))
-    end_row_indices.extend(list(range(last_offset, S)))
-
-    start_row_indices = paddle.to_tensor(start_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-    end_row_indices = paddle.to_tensor(end_row_indices, dtype=paddle.int32).reshape((1, 1, S, 1)).repeat_interleave(B, 0)
-    startend_row_indices = paddle.concat([start_row_indices, end_row_indices], axis=-1)
-
-    causal = True
-    return startend_row_indices, causal
-
-def generate_random_eviction_mask(B, S, H, D, start_row=4096):
-    start_rows_list = []
-    for bz_idx in range(B):
-        for head_idx in range(H):
-            start_rows = np.array([S+1] * S)
-            mask_pos = np.random.choice(S-1, S - start_row, replace=False)
-            index = np.arange(start_row, S)
-            mask_pos = np.concatenate([mask_pos[mask_pos < index - 1], mask_pos[mask_pos >= index - 1]])
-            start_rows[mask_pos] = index
-            start_rows_list.append(start_rows)
-    startend_row_indices = paddle.to_tensor(start_rows_list, dtype=paddle.int32).reshape((B, H, S, 1))
-    causal = True
-    return startend_row_indices, causal
 
 def generate_hybrid_swa_causal_mask(batch_size, seqlen, hkv, d, window_size=512, ratio=3):
     assert hkv % (ratio + 1) == 0
@@ -588,7 +270,9 @@ def generate_hybrid_swa_prefix_lm_document_mask(batch_size, seqlen, hkv, d, doc_
     hprefix = hkv // (ratio + 1)
 
     # Note(umiswing): its so silly that this gen func dont do anything for num head
-    prefix_lm_document_mask, _ = generate_prefix_lm_document_mask(batch_size, seqlen, hkv, d, doc_seq_lens)
+    prefix_lm_document_mask = paddle.to_tensor(
+        bench_common.prefix_lm_document_startend(doc_seq_lens, seqlen, batch_size), dtype=paddle.int32
+    )
     prefix_lm_document_mask = paddle.repeat_interleave(prefix_lm_document_mask, hkv, 1)
 
     swa_prefix_lm_document_mask = prefix_lm_document_mask[:,:hswa,:,:]
@@ -694,38 +378,9 @@ def load_mask(batch_size, seqlen, hkv, head_dim, path, causal, hybrid_mask_fn=No
     mask_np = startend_row_indices.numpy()
     return startend_row_indices, causal
 
-def split_sequence(sequence_length):
-    if sequence_length < 3:
-        raise ValueError("序列长度必须至少为 3，以保证能够分配给一个 Question 和两个 Answer。")
-    
-    # 确定 Answer 的数量
-    num_answers = random.randint(2, 6)
-    
-    # 初始化分配的长度
-    lengths = [1] * (num_answers + 1)  # 至少给每个部分分配一个长度，确保为正整数
-    
-    # 剩余的长度需要分配
-    remaining_length = sequence_length - sum(lengths)
-    
-    # 随机分配剩余的长度
-    for _ in range(remaining_length):
-        # 随机选择一个位置增加长度
-        index = random.randint(0, num_answers)
-        lengths[index] += 1
 
-    return lengths
-
-def method_name(fm_version, kv_mode):
-    """CSV / plot_radar method prefix for a (version, kv_mode) pair.
-
-    'shared' gets a suffix WITHOUT a separating underscore because plot_radar.py
-    globs '{method}_*': 'flashmaskv4_kvshared_...' would also match method
-    'flashmaskv4' and silently average the two modes together.
-    """
-    return f"flashmaskv{fm_version}" + ("kvshared" if kv_mode == "shared" else "")
-
-
-def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="", overwrite=True, head_dim=None, current_time=None, backend='cutedsl', kv_mode=None, use_sink=False, vs_sparse_attn=False, dedup_static_masks=False, first_sample_only=False):
+def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, series=None, results_dir=bench_common.RESULTS_DIR, overwrite=True, head_dim=None, current_time=None, backend='cutedsl', kv_mode=None, use_sink=False, vs_sparse_attn=False, dedup_static_masks=False, first_sample_only=False, check_masks=None, seqlens=None, interfere_grace=60.0,
+         interfere_max_wait=1800.0, allow_handoff=False):
     """Run the benchmark with the given examples.
 
     Args:
@@ -747,32 +402,21 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="", o
             away. It also pins the shapes to that kernel's constraints
             (H=64, HKV=1, d_v=512, kv_mode='shared'); an explicit --head_dim or
             --kv_mode still wins.
-        dedup_static_masks: skip the masks that only depend on S (S_ONLY_EXAMPLES)
-            on every sample but the first of each ``Total length`` block. Those
-            masks are identical across the 5 samples, so the extra 4 runs measure
-            the same kernel again. Applies under vs_sparse_attn as well, where it
-            leaves ``Causal`` on the first sample and ``Causal Document Mask`` on
-            all five.
+        dedup_static_masks: skip the masks that only depend on S
+            (bench_common.S_ONLY_MASKS) on every sample but the first of each
+            ``Total length`` block. Applies under vs_sparse_attn as well.
         first_sample_only: run only Sample 1 of each ``Total length`` block.
+        check_masks: write one fingerprint per (case, mask, kv_mode) to this jsonl
+            file instead of timing anything (see check_bench_consistency.py), plus the
+            output check of the timed fwd / bwd (bench_common.run_accuracy; kv_mode
+            split, cutedsl, no sink).
 
-    Sequence lengths and document layouts come from kernel_test_seq_info.txt --
-    every ``Total length`` block, every sample. Add a case by adding a line
-    there; nothing here is parameterised by seqlen.
+    Cases, masks, sparsity and iteration counts come from bench_common, shared with
+    benchmark_fa4_mask_mod.py and benchmark_cudnn_flex_mask_mod.py.
     """
     # Operations benchmark_flashmla_sparse_attn.py also produces (its `layouts`
     # dict). Keep in sync with that file.
     VS_SPARSE_EXAMPLES = ("Causal", "Causal Document Mask")
-
-    # These masks are a function of S alone (Full/Causal, or a window / global window /
-    # prefix / start row derived from S), so the 5 samples inside one "Total length"
-    # block of kernel_test_seq_info.txt all produce the identical mask. With
-    # --dedup_static_masks they are measured on the first sample of each block only.
-    # This applies under --vs_sparse_attn too: Causal is S-only there as well, so
-    # only Causal Document Mask is left on the later samples. plot_radar averages
-    # the samples of one seqlen by Operation name, so a row present in one sample
-    # file and absent from the others is handled.
-    S_ONLY_EXAMPLES = ("Full", "Causal", "Sliding Window", "Global Sliding Window",
-                       "Prefix LM Causal Mask", "Random Eviction Mask")
 
     if kv_mode is None:
         # The competitor's K and V are one single-head latent buffer, so 'shared'
@@ -825,186 +469,116 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="", o
                 "(see its unsupported_reason). Drop --head_dim or pass 512 / 576."
             )
 
-    total_length = 0
-    doc_seq_lens_list = []
-    with open('kernel_test_seq_info.txt', 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            if 'Total length' in line:
-                total_length = int(line.split(":")[1].split(',')[0].strip())
-            else:
-                doc_list = eval(line.split(":")[-1].split("#")[0].strip())
-                qksparse_mask = eval(line.split(":")[-1].split("#")[1].strip())
-                # The mask generators pad a short layout, each in its own way, so a
-                # layout that does not cover S silently measures a different mask.
-                doc_total = sum(seq_len for _, seq_len in doc_list)
-                assert doc_total == total_length, (
-                    f"kernel_test_seq_info.txt: documents sum to {doc_total}, "
-                    f"not Total length {total_length}: {line[:60]}"
-                )
-                doc_seq_lens_list.append((total_length, doc_list, qksparse_mask))
-        #doc_seq_lens_list = doc_seq_lens_list[::-1]
-        # The first sample of each "Total length" block: the one entry per S that
-        # still measures the S_ONLY_EXAMPLES under --dedup_static_masks.
-        first_idx_of_S = {}
-        for i, (s, _, _) in enumerate(doc_seq_lens_list):
-            first_idx_of_S.setdefault(s, i)
-        for D in d_list:
-            if D == 192:
-                DV = 128
-                H = 16
-            elif D == 576:
-                DV = 512
-                H = 8
-            else:
-                DV = D
-                H = 4096 // D
+    if check_masks:
+        open(check_masks, "w").close()
 
-            if vs_sparse_attn:
-                H = 64
-                HKV = 1
-            else:    
-                HKV = H
+    # Result series: <series> for kv_mode split, <series>_kvshared for shared.
+    base_series = series or f"fm{fm_version}" + ("" if dtype == "bf16" else f"_{dtype}")
+    series_of = lambda mode: base_series + ("_kvshared" if mode == "shared" else "")
 
-            # kv_mode='shared' only means something where the backward actually
-            # merges dK and dV; anywhere else it is the split kernel with an
-            # aliased V, i.e. a duplicate of the 'split' number for twice the
-            # wall clock. Decide once per D instead of re-testing per sample.
-            if (D, DV) in KV_SHARED_D_DV:
-                d_kv_modes = kv_modes
-            else:
-                d_kv_modes = [m for m in kv_modes if m != 'shared']
-                if 'shared' in kv_modes:
-                    print(f"D={D} DV={DV}: skipping kv_mode=shared, the dK/dV "
-                          f"merge is only implemented for {KV_SHARED_D_DV} so it "
-                          f"would just repeat the 'split' measurement.")
-                if not d_kv_modes:
-                    continue
+    last_D = None
+    for case in bench_common.iter_cases(d_list, examples, dedup_static_masks, first_sample_only, seqlens):
+        if vs_sparse_attn:
+            case = case._replace(B=1, H=64, HKV=1)
+        sample, B, H, HKV, D, DV = case.sample, case.B, case.H, case.HKV, case.D, case.DV
+        S, idx = sample.S, sample.idx
+        SQ = SKV = S
 
-            for idx, (S, prefix_doc_seq_lens, qksparse_mask) in enumerate(doc_seq_lens_list):
-                if first_sample_only and idx != first_idx_of_S[S]:
-                    continue
-                if vs_sparse_attn:
-                    B = 1
-                else:
-                    B = 128 * 1024 // S
+        # kv_mode='shared' only means something where the backward actually
+        # merges dK and dV; anywhere else it is the split kernel with an
+        # aliased V, i.e. a duplicate of the 'split' number for twice the
+        # wall clock.
+        if (D, DV) in KV_SHARED_D_DV:
+            d_kv_modes = kv_modes
+        else:
+            d_kv_modes = [m for m in kv_modes if m != 'shared']
+            if 'shared' in kv_modes and D != last_D:
+                print(f"D={D} DV={DV}: skipping kv_mode=shared, the dK/dV "
+                      f"merge is only implemented for {KV_SHARED_D_DV} so it "
+                      f"would just repeat the 'split' measurement.")
+        last_D = D
+        if not d_kv_modes:
+            continue
 
-                SQ = S
-                SKV = S
-                doc_seq_lens = [x[1] for x in prefix_doc_seq_lens]
-                maskout_pair = []
-                offset = 0
-                print(f"{B}_{S}_{H}_{HKV}_{D}_{DV}_{idx}_{dtype}")
-                if not overwrite:
-                    # Same name as the file written below, so a rerun with the same
-                    # --current_time picks up where a killed run stopped.
-                    done = [
-                        os.path.exists(f"{dtype}{suffix}/{method_name(fm_version, m)}_{current_time}_{B}_{S}_{H}_{HKV}_{D}_{DV}_{idx}.csv")
-                        for m in d_kv_modes
-                    ]
-                    if all(done):
-                        print(f"{dtype}{suffix}/*_{current_time}_{B}_{S}_{H}_{HKV}_{D}_{DV}_{idx}.csv already exists for kv_mode={d_kv_modes}, skipping (--no-overwrite).")
-                        continue
-                if sum(qksparse_mask) == 0:
-                    maskout_pair = [(1024, 538), (2358, 1700)]
-                else:
-                    for is_maskout, doc_seq in zip(qksparse_mask, doc_seq_lens):
-                        if is_maskout:
-                            maskout_pair.append((offset, doc_seq))
-                        offset += doc_seq
+        ex_to_run = list(case.masks)
+        if vs_sparse_attn:
+            dropped = [ex for ex in ex_to_run if ex not in VS_SPARSE_EXAMPLES]
+            if dropped:
+                print(f"--vs_sparse_attn: dropping {dropped}, "
+                      f"benchmark_flashmla_sparse_attn.py only emits "
+                      f"{list(VS_SPARSE_EXAMPLES)} and plot_radar keeps "
+                      f"only the operations every method shares.")
+            ex_to_run = [ex for ex in ex_to_run if ex in VS_SPARSE_EXAMPLES]
+        if not ex_to_run:
+            continue
 
-                share_qa_docs = [split_sequence(doc_seq) for doc_seq in doc_seq_lens]
-                # Every entry takes kv_mode ('split' | 'shared') so the same mask
-                # can be measured with K and V separate or aliased into one buffer.
-                available_examples = {
-                    "Full": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_none_mask, causal=False), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
-                    "Causal": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_none_mask, causal=True), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
-                    "Sliding Window": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_sliding_window_mask, window_size=int(S*0.0625)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
-                    "Global Sliding Window": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
-                    "Causal Document Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
-                    "Document Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
-                    "Share Question Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
-                    "Causal Blockwise Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_causal_blockwise_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
-                    "Prefix LM Document Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
-                    "Prefix LM Causal Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_prefix_lm_causal_mask, prefix_length=int(S*0.5)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
-                    "QK-sparse Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_qk_sparse_mask, maskout_pair=maskout_pair), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
-                    "Random Eviction Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_random_eviction_mask, start_row=S//2), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
-                    # "Hybrid SWA Prefix LM Doc": lambda kv_mode: test_mask(generate_mask_fn=partial(generate_hybrid_swa_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
-                    # Note(umiswing): support load mask and hybrid mask like this, and also, support simulate cp benchmark
-                    # "Dumped Mask": lambda kv_mode: test_mask(generate_mask_fn=partial(load_mask, path=mask_path, causal=False, cp_size=cp_size, cp_rank=cp_rank), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
-                    # "Hybrid SWA": lambda kv_mode: test_mask(generate_mask_fn=partial(load_mask, path=mask_path, causal=False, cp_size=cp_size, cp_rank=cp_rank, hybrid_mask_fn=partial(hybrid_swa, window_size=512, swa_ratio=0.75)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype, backend=backend, kv_mode=kv_mode, use_sink=use_sink),
-                }
+        print(f"{B}_{S}_{H}_{HKV}_{D}_{DV}_{idx}_{dtype}")
+        specs = {ex: bench_common.build_mask(ex, case) for ex in ex_to_run}
 
-
-                if "all" in examples:
-                    ex_to_run = list(available_examples.keys())
-                else:
-                    ex_to_run = examples
-
-                if dedup_static_masks and idx != first_idx_of_S[S]:
-                    ex_to_run = [ex for ex in ex_to_run if ex not in S_ONLY_EXAMPLES]
-
-                if vs_sparse_attn:
-                    dropped = [ex for ex in ex_to_run if ex not in VS_SPARSE_EXAMPLES]
-                    if dropped:
-                        print(f"--vs_sparse_attn: dropping {dropped}, "
-                              f"benchmark_flashmla_sparse_attn.py only emits "
-                              f"{list(VS_SPARSE_EXAMPLES)} and plot_radar keeps "
-                              f"only the operations every method shares.")
-                    ex_to_run = [ex for ex in ex_to_run if ex in VS_SPARSE_EXAMPLES]
-
-                if not ex_to_run:
-                    print("Nothing left to measure for this sample after the "
-                          "--dedup_static_masks / --vs_sparse_attn filters, skipping.")
-                    continue
-
+        if check_masks:
+            for ex, spec in specs.items():
+                fp = bench_common.fingerprint(*bench_common.visible_counts(spec.causal, spec.startend, B, S, SKV))
                 for mode in d_kv_modes:
-                    results = []
-                    for ex in ex_to_run:
-                        if ex in available_examples:
-                            print(f"{ex} [kv_mode={mode}]")
-                            t_mask = time.time()
-                            fw_time, bw_time, total_time, fw_flops, bw_flops, total_flops, fw_tflops, bw_tflops, total_tflops, sparsity = available_examples[ex](mode)
-                            # Wall clock of the whole mask (compile + mask build + timing runs).
-                            print(f"[time] S={S} D={D} mask={ex} kv_mode={mode} wall={time.time() - t_mask:.1f}s "
-                                  f"(fwd {fw_time:.2f} ms, bwd {bw_time:.2f} ms)")
-                            results.append([ex, f"{fw_time:.4f}", f"{bw_time:.4f}", f"{total_time:.4f}", f"{fw_flops:.4f}", f"{bw_flops:.4f}", f"{total_flops:.4f}", f"{fw_tflops:.4f}", f"{bw_tflops:.4f}", f"{total_tflops:4f}", f"{sparsity:.4f}"])
-                        else:
-                            print(f"Warning: Unknown example key '{ex}'. Skipping.")
+                    # Outputs are checked on kv_mode split only (the reference has no shared V).
+                    acc = None
+                    if mode == 'split' and backend == 'cutedsl' and not use_sink:
+                        acc = bench_common.run_accuracy(case, ex, lambda c, s, inputs: test_mask(
+                            spec=s, B=c.B, S=S, SKV=SKV, H=c.H, HKV=c.HKV, D=D, DV=DV, dtype=dtype,
+                            backend=backend, kv_mode=mode, inputs=inputs, outputs_only=True), check_masks)
+                        print(f"[acc] S={S} D={D} {ex}: {'ok' if acc is None or acc['ok'] else 'FAIL'}")
+                    bench_common.append_jsonl(check_masks, bench_common.check_record("flashmask", case, spec, fp, mode, acc))
+            continue
 
-                    # Usage in your results formatting:
-                    headers = [
-                        "Operation",
-                        "FW Time (ms)",
-                        "BW Time (ms)",
-                        "TOTAL Time (ms)",
-                        "FW FLOPs",
-                        "BW FLOPs",
-                        "TOTAL FLOPs",
-                        "FW TFLOPs/s",
-                        "BW TFLOPs/s",
-                        "TOTAL TFLOPs/s",
-                        "Sparsity",
-                    ]
-                    print(
-                        tabulate(
-                            results,
-                            headers=headers,
-                            tablefmt="grid",
-                        )
-                    )
-                    content2=tabulate(results, headers=headers, tablefmt="tsv")
-                    os.makedirs(f"{dtype}{suffix}", exist_ok=True)
-                    # Note(umiswing): this file name is better, but i need to keep the old name for fig plotting
-                    # Note: no underscore before "kvshared" on purpose -- plot_radar.py
-                    # globs "{method}_*", so "flashmaskv4_kvshared_..." would also be
-                    # picked up as method "flashmaskv4" and mix the two modes.
-                    method = method_name(fm_version, mode)
-                    text_file = open(f"{dtype}{suffix}/{method}_{current_time}_{B}_{S}_{H}_{HKV}_{D}_{DV}_{idx}.csv","w")
-                    text_file.write(content2)
-                    text_file.close()
+        for mode in d_kv_modes:
+            out = bench_common.csv_path(results_dir, current_time, series_of(mode), case)
+            bench_common.write_meta(results_dir, current_time, series_of(mode), "flashmask",
+                                    packages=["flashmask", "paddle"], fm_version=fm_version,
+                                    kv_mode=mode, dtype=dtype, backend_kind=backend, use_sink=use_sink,
+                                    gpu=paddle.device.cuda.get_device_name())
+
+            def run_mask(ex):
+                print(f"{ex} [kv_mode={mode}]")
+                t_mask = time.time()
+                fw_time, bw_time, total_time, fw_flops, bw_flops, total_flops, fw_tflops, bw_tflops, total_tflops, sparsity = test_mask(
+                    spec=specs[ex], B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, DV=DV,
+                    dtype=dtype, backend=backend, kv_mode=mode, use_sink=use_sink,
+                )
+                # Wall clock of the whole mask (compile + timing runs).
+                print(f"[time] S={S} D={D} mask={ex} kv_mode={mode} wall={time.time() - t_mask:.1f}s "
+                      f"(fwd {fw_time:.2f} ms, bwd {bw_time:.2f} ms)")
+                return [ex, f"{fw_time:.4f}", f"{bw_time:.4f}", f"{total_time:.4f}", f"{fw_flops:.4f}", f"{bw_flops:.4f}", f"{total_flops:.4f}", f"{fw_tflops:.4f}", f"{bw_tflops:.4f}", f"{total_tflops:4f}", f"{sparsity:.4f}"]
+
+            # Same --current_time + --no-overwrite: a rerun (or a handed-off task) picks
+            # up where the last one stopped. Disturbed measurements are never written.
+            results = bench_common.run_masks_to_csv(out, ex_to_run, run_mask, overwrite,
+                                                    own_mem=paddle.device.cuda.memory_reserved,
+                                                    grace=interfere_grace, max_wait=interfere_max_wait,
+                                                    allow_handoff=allow_handoff)
+            if results is None:
+                continue
+
+            # Usage in your results formatting:
+            headers = [
+                "Operation",
+                "FW Time (ms)",
+                "BW Time (ms)",
+                "TOTAL Time (ms)",
+                "FW FLOPs",
+                "BW FLOPs",
+                "TOTAL FLOPs",
+                "FW TFLOPs/s",
+                "BW TFLOPs/s",
+                "TOTAL TFLOPs/s",
+                "Sparsity",
+            ]
+            print(
+                tabulate(
+                    results,
+                    headers=headers,
+                    tablefmt="grid",
+                )
+            )
+            print(f"wrote {out}")
 
 if __name__ == "__main__":
     from jsonargparse import ArgumentParser
@@ -1031,9 +605,16 @@ if __name__ == "__main__":
         default=1
     )
     parser.add_argument(
-        "--suffix",
+        "--series",
         type=str,
-        default=""
+        default=None,
+        help="Result series name (default fm<fm_version>; kv_mode shared adds _kvshared). "
+        "CSVs go to <results_dir>/<current_time>/<series>/.",
+    )
+    parser.add_argument(
+        "--results_dir",
+        type=str,
+        default=bench_common.RESULTS_DIR,
     )
     parser.add_argument(
         "--head_dim",
@@ -1073,6 +654,25 @@ if __name__ == "__main__":
         help="Skip the samples whose CSVs for this --current_time already exist "
         "(resume a killed run by passing its --current_time again).",
     )
+    parser.add_argument(
+        "--interfere_grace",
+        type=float,
+        default=60.0,
+        help="Seconds another process may hold the GPU before giving up on it: with "
+        "--allow_handoff exit 75 (run_perf.sh moves the task to another aq GPU), else "
+        "keep waiting up to --interfere_max_wait. Disturbed measurements are discarded.",
+    )
+    parser.add_argument(
+        "--interfere_max_wait",
+        type=float,
+        default=1800.0,
+        help="Without --allow_handoff, fail after waiting this long for the GPU.",
+    )
+    parser.add_argument(
+        "--allow_handoff",
+        action="store_true",
+        help="Exit with code 75 when another process keeps the GPU past --interfere_grace.",
+    )
 
     parser.add_argument(
         "--use_sink",
@@ -1104,6 +704,23 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--check_masks",
+        type=str,
+        default=None,
+        help="Write the mask fingerprint of every (case, mask, kv_mode) and the output check "
+        "of the timed fwd / bwd against a shared reference to this jsonl file instead of "
+        "timing; compare backends with check_bench_consistency.py.",
+    )
+
+    parser.add_argument(
+        "--seqlens",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Only these 'Total length' blocks of kernel_test_seq_info.txt, e.g. --seqlens 4096.",
+    )
+
+    parser.add_argument(
         "--first_sample_only",
         action="store_true",
         default=False,
@@ -1111,4 +728,4 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    main(**vars(args))
+    bench_common.run_main(main, **vars(args))
