@@ -1,3 +1,4 @@
+import contextlib
 import os
 import numpy as np
 from functools import lru_cache
@@ -17,7 +18,7 @@ from attn_gym.masks import causal_mask
 
 from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
 
-from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd, _tile_size_fwd_sm90, _tile_size_bwd_sm90
+from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
 
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
 
@@ -33,12 +34,15 @@ from datetime import datetime
 torch.set_default_device("cuda")
 torch.manual_seed(0)
 
-np.random.seed(0)
-random.seed(0)
+import bench_common
 
 torch._dynamo.config.cache_size_limit = 1000
 # dynamic-shape recompiles of create_block_mask return wrong mask_block_cnt; keep them static
 torch._dynamo.config.automatic_dynamic_shapes = False
+
+# SM100 hdim 256 backward: FA4's dedicated kernels reject mask_mod and block sparsity, so run
+# the generic FlashAttentionBackwardSm100 path (64-row KV tile, 2CTA). Only affects hdim 256.
+os.environ.setdefault("FLASH_ATTENTION_HD256_GENERIC_BWD", "1")
 
 def compute_block_sparse_tensors(
     flex_mask_mod,
@@ -94,20 +98,7 @@ def compute_block_sparse_tensors(
         block_sparse_tensors_bwd = None
     return block_sparse_tensors_fwd, block_sparse_tensors_bwd
 
-def compute_density_sparsity(flex_mask_mod, causal, B, H, M, N, tile_m, tile_n, device="cuda"):
-    if flex_mask_mod is not None:
-        block_mask = create_block_mask(flex_mask_mod, B, H, M, N, device=device, _compile=True, BLOCK_SIZE=[tile_m, tile_n])
-        density = (100 - block_mask.sparsity()) / 100
-    elif causal:
-        # Note(umiswing): if seqlen_q != seqlen_k, the density of causal is not 0.5
-        assert M == N
-        # count skipped tile_m x tile_n blocks, same as flashmask_block_sparsity
-        density = 1 - (M // tile_m - 1) / (2 * (M // tile_m))
-    else:
-        density = 1.0
 
-    sparsity = 1.0 - density
-    return density, sparsity
 
 def calculate_tflops(flops: float, time_ms: float, multiplier: int) -> float:
     return multiplier * flops * (1e3 / time_ms) / 1e12
@@ -125,87 +116,9 @@ def cal_flops(B, H, Sq, Sk, D, DV, mode='fwd'):
 def cal_tflops(flops, time_ms):
     return  flops * (1e3 / time_ms) / 1e12
 
-def _summarize_statistics(times, quantiles, return_mode):
-    if quantiles is not None:
-        ret = torch.quantile(times, torch.tensor(quantiles, dtype=torch.float32)).tolist()
-        if len(ret) == 1:
-            ret = ret[0]
-        return ret
-    if return_mode == "all":
-        return times.tolist()
-    return getattr(torch, return_mode)(times).item()
 
-def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean"):
-    """
-    Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
-    the 20-th and 80-th performance percentile.
-
-    :param fn: Function to benchmark
-    :type fn: Callable
-    :param warmup: Warmup time (in ms)
-    :type warmup: int
-    :param rep: Repetition time (in ms)
-    :type rep: int
-    :param grad_to_none: Reset the gradient of the provided tensor to None
-    :type grad_to_none: torch.tensor, optional
-    :param quantiles: Performance percentile to return in addition to the median.
-    :type quantiles: list[float], optional
-    :param fast_flush: Use faster kernel to flush L2 cache between measurements
-    :type fast_flush: bool, default is True
-    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all" Default is "mean".    :type return_mode: str
-    """
-    assert return_mode in ["min", "max", "mean", "median", "all"]
-
-    fn()
-
-    torch.cuda.synchronize()
-
-    # We maintain a buffer of 256 MB that we clear
-    # before each kernel call to make sure that the L2 cache
-    # doesn't contain any input data before the run
-    cache_size = 256 * 1024 * 1024
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if fast_flush:
-        cache = torch.empty(int(cache_size // 4), dtype=torch.int32, device=device)
-    else:
-        cache = torch.empty(int(cache_size), dtype=torch.int8, device=device)
-
-    # Estimate the runtime of the function
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(5):
-        cache.zero_()
-        fn()
-    end_event.record()
-    torch.cuda.synchronize()
-    estimate_ms = start_event.elapsed_time(end_event) / 5
-
-    # compute number of warmup and repeat
-    n_warmup = max(1, int(warmup / estimate_ms))
-    n_repeat = max(1, int(rep / estimate_ms))
-    n_warmup = 10
-    n_repeat = 50
-    start_event = [torch.cuda.Event(enable_timing=True) for i in range(n_repeat)]
-    end_event = [torch.cuda.Event(enable_timing=True) for i in range(n_repeat)]
-    # Warm-up
-    for _ in range(n_warmup):
-        fn()
-    # Benchmark
-    gc.collect()
-    gc.disable()
-    for i in range(n_repeat):
-        if grad_to_none is not None:
-            for x in grad_to_none:
-                x.grad = None
-        #cache.zero_()
-        start_event[i].record()
-        fn()
-        end_event[i].record()
-    gc.enable()
-    torch.cuda.synchronize()
-    times = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float32)
-    return _summarize_statistics(times, quantiles, return_mode)
+def do_bench(fn, S):
+    return bench_common.do_bench(fn, S, torch.cuda.synchronize, torch.cuda.Event)
 
 def print_header(text):
     width = 91
@@ -215,6 +128,7 @@ def print_header(text):
 
 def test_mask(
     mask_info,
+    spec,
     B,
     H,
     HKV,
@@ -225,7 +139,11 @@ def test_mask(
     skip_correctness: bool = False,
     print_mask: bool = True,
     device: str = "cuda",
+    inputs=None,
+    outputs_only: bool = False,
 ):
+    """Time the fwd / bwd of one mask, or with outputs_only run them once on inputs
+    (numpy q, k, v, dout from bench_common.acc_inputs) and return the outputs."""
     # Note(umiswing): see https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/interface.py#L708-L711
     # btw, we actually should not set block_mask_nheads to 1, it should always be qhead, otherwise the mask info is wrong
     # original fa cute test so stupid...
@@ -245,13 +163,14 @@ def test_mask(
 
     major, _ = torch.cuda.get_device_capability()
     if major == 9:
+        # The SM90 tile helpers moved from interface._tile_size_{fwd,bwd}_sm90 to config.py.
+        from flash_attn.cute.config import select_sm90_tile, select_sm90_bwd_tile
         # SM90 has no kv subtiling: the sparse KV block must equal the kernel's tile_n
         # (hdim256 -> 128x80, hdim192 -> 128x128; 128x128 overflows smem at hdim256).
-        fwd_cfg = _tile_size_fwd_sm90(D, DV, kernel_causal, False, sparse_block_size_q=256)
-        tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
+        tile_m, tile_n = select_sm90_tile(D, DV, kernel_causal, False, sparse_block_size_q=256)[:2]
         sparse_tile_m_fwd = tile_m
         # SM90 bwd picks its own tiles (hdim192 -> tile_n=96, hdim256 w/ block sparsity -> 64).
-        sparse_tile_n_bwd = _tile_size_bwd_sm90(D, DV, kernel_causal, False, sparse_block_size_q=sparse_tile_m_fwd).n_block_size
+        sparse_tile_n_bwd = select_sm90_bwd_tile(D, DV, kernel_causal, False, sparse_block_size_q=sparse_tile_m_fwd)["tile_n"]
     else:
         tile_m = 128
         tile_n = 128
@@ -277,19 +196,10 @@ def test_mask(
     bsp_fwd = block_sparse_tensors(tile_n)[0]
     bsp_bwd = block_sparse_tensors(sparse_tile_n_bwd)[1]
 
-    density, sparsity = compute_density_sparsity(
-        flex_mask_mod=flex_mask_mod,
-        causal=causal,
-        B=B,
-        H=H,
-        M=S,
-        N=S,
-        tile_m=128,
-        tile_n=128
-    )
-    if mask_info.get("flashmask_sparsity") is not None:
-        sparsity = mask_info["flashmask_sparsity"]
-        density = 1.0 - sparsity
+    # Element-level sparsity of the shared flashmask layout (bench_common), the same for
+    # every backend; --check_masks verifies this backend's mask is that layout.
+    sparsity = bench_common.element_sparsity(causal, spec.startend, S, S)
+    density = 1.0 - sparsity
 
     q = torch.randn(B, S, H, D, device=device, dtype=data_type, requires_grad=True)
     k = torch.randn(B, S, HKV, D, device=device, dtype=data_type, requires_grad=True)
@@ -301,6 +211,12 @@ def test_mask(
     ]
 
     lse = torch.empty(B, H, S, device=device, dtype=torch.float32)
+    if inputs is not None:
+        q, k, v, gradOut = [torch.from_numpy(x).to(device, data_type).requires_grad_() for x in inputs]
+    if outputs_only:
+        # Preallocated by us, so poisoned here; the bwd buffers through torch_poison_empty.
+        out.data.fill_(float("nan"))
+        lse.fill_(float("nan"))
 
     fa4_mask_mod_call = lambda: _flash_attn_fwd(
         q=q, k=k, v=v,
@@ -318,11 +234,14 @@ def test_mask(
 
     # Forward pass
     # torch.cuda.nvtx.range_push("fa4")
-    fwd_time_ms = do_bench(fa4_mask_mod_call)
+    if not outputs_only:
+        fwd_time_ms = do_bench(fa4_mask_mod_call, S)
     # torch.cuda.nvtx.range_pop()
     torch._functorch.config.donated_buffer=False
     # Backward pass
-    out_cute, lse_cute, _, _ = fa4_mask_mod_call()
+    # _flash_attn_fwd returns (out, lse, ...): 4 values in older FA4, 5 in newer
+    with bench_common.torch_poison_empty() if outputs_only else contextlib.nullcontext():
+        out_cute, lse_cute = fa4_mask_mod_call()[:2]
 
     fa4_mask_mod_bwd_call = lambda: _flash_attn_bwd(
         q=q,
@@ -342,8 +261,13 @@ def test_mask(
         pack_gqa=pack_gqa,
     )
 
+    if outputs_only:
+        with bench_common.torch_poison_empty():
+            dq, dk, dv = fa4_mask_mod_bwd_call()[:3]
+        return bench_common.torch_outputs(out_cute, dq, dk, dv)
+
     # torch.cuda.nvtx.range_push("fa4")
-    bwd_time_ms = do_bench(fa4_mask_mod_bwd_call)
+    bwd_time_ms = do_bench(fa4_mask_mod_bwd_call, S)
     # torch.cuda.nvtx.range_pop()
 
     total_time_ms = fwd_time_ms + bwd_time_ms
@@ -358,7 +282,7 @@ def test_mask(
 
     return fwd_time_ms, bwd_time_ms, total_time_ms, fwd_flops, bwd_flops, total_flops, fwd_tflops, bwd_tflops, total_tflops, sparsity
 
-def generate_sliding_window(window_size: int):
+def generate_sliding_window(window_size: int, B=16, S=8192, device="cuda"):
 
     def sliding_window(b, h, q_idx, kv_idx):
         return q_idx - kv_idx < window_size
@@ -393,6 +317,7 @@ def generate_causal_document_mask(B=16, S=8192, doc_seq_lens=[2538, 1742, 3213],
     assert total_seq_len <= S
     assert len(doc_seq_lens) >= 3
     padding = S - np.sum(doc_seq_lens)
+    doc_seq_lens = list(doc_seq_lens)
     doc_seq_lens[-1] += padding
     seq_cusums = np.cumsum(doc_seq_lens)
 
@@ -486,7 +411,7 @@ def generate_share_question_mask(B=16, S=8192, doc_seq_lens=[2538, 1742, 3213], 
     assert len(doc_seq_lens) >= 1
     padding = S - total_seq_len
     if padding > 0:
-        doc_seq_lens.append([padding])
+        doc_seq_lens = list(doc_seq_lens) + [[padding]]
 
     startend_row_indices = []
     seqlen_so_far = 0
@@ -710,16 +635,6 @@ def generate_qk_sparse_mask(B=16, S=8192, maskout_pair=[(1024, 538), (2358, 1700
 
     assert len(row_indices) == S, len(row_indices)
 
-    # Sparsity as benchmark_flashmask.flashmask_block_sparsity counts this mask (LT range
-    # [kv_idx, row_indices) under causal): unlike create_block_mask it keeps the diagonal
-    # blocks of a masked-out span, so report the same FLOPs base as flashmask.
-    T = S // 128
-    lt_start_max = np.arange(1, T + 1) * 128 - 1
-    lt_end_min = np.asarray(row_indices).reshape(T, 128).min(-1)
-    i = np.arange(T).reshape(T, 1)
-    skip = (np.arange(T) > i) | ((i * 128 >= lt_start_max) & ((i + 1) * 128 <= lt_end_min))
-    flashmask_sparsity = skip.sum() / (T * T)
-
     row_indices = torch.tensor(row_indices, device=device, dtype=torch.int32).reshape((1, -1)).repeat_interleave(B, 0)
 
     def qk_sparse_mask(b, h, q_idx, kv_idx):
@@ -742,22 +657,13 @@ def generate_qk_sparse_mask(B=16, S=8192, maskout_pair=[(1024, 538), (2358, 1700
         "flex_mask_mod": qk_sparse_mask,
         "aux_tensors": [row_indices],
         "causal": True, # Note(umiswing): should this be true?
-        "flashmask_sparsity": flashmask_sparsity,
     }
 
 
-def generate_random_eviction_mask(B=16, H=16, HKV=16, S=8192, start_row=4096, device="cuda"):
+def generate_random_eviction_mask(B=16, H=16, HKV=16, S=8192, start_row=4096, rows=None, device="cuda"):
     assert H == HKV
-    start_rows_list = []
-    for bz_idx in range(B):
-        for head_idx in range(H):
-            start_rows = np.array([S+1] * S)
-            mask_pos = np.random.choice(S-1, S - start_row, replace=False)
-            index = np.arange(start_row, S)
-            mask_pos = np.concatenate([mask_pos[mask_pos < index - 1], mask_pos[mask_pos >= index - 1]])
-            start_rows[mask_pos] = index
-            start_rows_list.append(start_rows)
-    startend_row_indices = torch.tensor(start_rows_list, device=device, dtype=torch.int32).reshape((B, H, S))
+    # rows: bench_common.eviction_rows, [B, H, S], the draw every backend shares.
+    startend_row_indices = torch.as_tensor(rows, device=device, dtype=torch.int32).reshape((B, H, S))
 
     def random_eviction_mask(b, h, q_idx, kv_idx):
         return q_idx < startend_row_indices[b, h, kv_idx]
@@ -848,140 +754,107 @@ def generate_hybrid_swa_prefix_lm_document_mask(batch_size, seqlen, hkv, d, doc_
         "causal": False,
     }
 
-def split_sequence(sequence_length):
-    if sequence_length < 3:
-        raise ValueError("序列长度必须至少为 3，以保证能够分配给一个 Question 和两个 Answer。")
-    
-    # 确定 Answer 的数量
-    num_answers = random.randint(2, 6)
-    
-    # 初始化分配的长度
-    lengths = [1] * (num_answers + 1)  # 至少给每个部分分配一个长度，确保为正整数
-    
-    # 剩余的长度需要分配
-    remaining_length = sequence_length - sum(lengths)
-    
-    # 随机分配剩余的长度
-    for _ in range(remaining_length):
-        # 随机选择一个位置增加长度
-        index = random.randint(0, num_answers)
-        lengths[index] += 1
 
-    return lengths
 
-def main(examples: List[str] = ["all"], dtype='bf16', head_dim=None, current_time=None):
+def _mask_heads(mask_info, H):
+    """H when an aux tensor is [B, H, S] (head-dependent mask), else 1."""
+    aux = mask_info["aux_tensors"]
+    return H if aux is not None and any(t.dim() == 3 for t in aux) else 1
+
+
+def make_mask_info(spec, case, device="cuda"):
+    """This backend's mask_mod for one bench_common mask, built from the same parameters."""
+    B, S, H, HKV = case.B, case.sample.S, case.H, case.HKV
+    p = spec.params
+    name = spec.name
+    if name in ("Full", "Causal"):
+        return {"cute_mask_mod": None, "flex_mask_mod": None, "aux_tensors": None, "causal": spec.causal}
+    if name == "Sliding Window":
+        return generate_sliding_window(window_size=p["window_size"], B=B, S=S, device=device)
+    if name == "Global Sliding Window":
+        return generate_global_sliding_window_mask(B=B, S=S, global_token=p["global_token"], window_size=p["window_size"], device=device)
+    if name == "Causal Document Mask":
+        return generate_causal_document_mask(B=B, S=S, doc_seq_lens=p["doc_seq_lens"], device=device)
+    if name == "Document Mask":
+        return generate_document_mask(B=B, S=S, doc_seq_lens=p["doc_seq_lens"], device=device)
+    if name == "Share Question Mask":
+        return generate_share_question_mask(B=B, S=S, doc_seq_lens=p["doc_seq_lens"], device=device)
+    if name == "Causal Blockwise Mask":
+        return generate_causal_blockwise_mask(B=B, S=S, doc_seq_lens=p["doc_seq_lens"], device=device)
+    if name == "Prefix LM Document Mask":
+        return generate_prefix_lm_document_mask(B=B, S=S, doc_seq_lens=p["doc_seq_lens"], device=device)
+    if name == "Prefix LM Causal Mask":
+        return generate_prefix_lm_causal_mask(B=B, S=S, prefix_length=p["prefix_length"], device=device)
+    if name == "QK-sparse Mask":
+        return generate_qk_sparse_mask(B=B, S=S, maskout_pair=p["maskout_pair"], device=device)
+    if name == "Random Eviction Mask":
+        return generate_random_eviction_mask(B=B, H=H, HKV=HKV, S=S, start_row=p["start_row"], rows=p["rows"], device=device)
+    raise ValueError(f"unknown mask {name!r}")
+
+
+def main(examples: List[str] = ["all"], dtype='bf16', head_dim=None, current_time=None,
+         dedup_static_masks=False, first_sample_only=False, check_masks=None, seqlens=None,
+         series=None, results_dir=bench_common.RESULTS_DIR, overwrite=True, interfere_grace=60.0,
+         interfere_max_wait=1800.0, allow_handoff=False):
     """Run the benchmark with the given examples.
 
-    Args:
-        examples: List of examples to run. If "all" is specified, all examples will be run.
+    Cases, masks, sparsity and iteration counts come from bench_common, shared with
+    benchmark_flashmask.py and the other competitor benchmark. --check_masks writes
+    one fingerprint per (case, mask) of what this backend hands its kernel, instead
+    of timing (see check_bench_consistency.py).
     """
     if current_time is None:
         current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
-    total_length = 0
-    doc_seq_lens_list = []
-    with open('kernel_test_seq_info.txt', 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
+    if check_masks:
+        open(check_masks, "w").close()
+    series = series or "fa4" + ("" if dtype == "bf16" else f"_{dtype}")
+
+    head_dims = [128, 192, 256] if head_dim is None else [head_dim]
+    for case in bench_common.iter_cases(head_dims, examples, dedup_static_masks, first_sample_only, seqlens):
+        B, H, HKV, D, DV = case.B, case.H, case.HKV, case.D, case.DV
+        S, idx = case.sample.S, case.sample.idx
+        print(f"{B}_{S}_{H}_{D}_{DV}_{idx}_{dtype}")
+        out = bench_common.csv_path(results_dir, current_time, series, case)
+        if not check_masks:
+            bench_common.write_meta(results_dir, current_time, series, "fa4", packages=["flash_attn", "torch", "cutlass"],
+                                    dtype=dtype, gpu=torch.cuda.get_device_name())
+
+            def run_mask(ex):
+                print(ex)
+                spec = bench_common.build_mask(ex, case)
+                ret = test_mask(mask_info=make_mask_info(spec, case), spec=spec, B=B, S=S, H=H, HKV=HKV,
+                                D=D, DV=DV, dtype=dtype)
+                if ret is None:
+                    return None
+                fw_time, bw_time, total_time, fw_flops, bw_flops, total_flops, fw_tflops, bw_tflops, total_tflops, sparsity = ret
+                return [ex, f"{fw_time:.4f}", f"{bw_time:.4f}", f"{total_time:.4f}", f"{fw_flops:.4f}", f"{bw_flops:.4f}", f"{total_flops:.4f}", f"{fw_tflops:.4f}", f"{bw_tflops:.4f}", f"{total_tflops:4f}", f"{sparsity:.4f}"]
+
+            # Same --current_time + --no-overwrite: a rerun (or a handed-off task) picks
+            # up where the last one stopped. Disturbed measurements are never written.
+            results = bench_common.run_masks_to_csv(out, case.masks, run_mask, overwrite,
+                                                    own_mem=torch.cuda.memory_reserved,
+                                                    grace=interfere_grace, max_wait=interfere_max_wait,
+                                                    allow_handoff=allow_handoff)
+            if results is None:
                 continue
-            if 'Total length' in line:
-                total_length = int(line.split(":")[1].split(',')[0].strip())
-            else:
-                doc_list = eval(line.split(":")[-1].split("#")[0].strip())
-                qksparse_mask = eval(line.split(":")[-1].split("#")[1].strip())
-                doc_seq_lens_list.append((total_length, doc_list, qksparse_mask))
-            
-        #doc_seq_lens_list = doc_seq_lens_list[::-1]
-        # Note(umiswing): fa4 does not support d 256
-        # One head_dim per process (--head_dim), like benchmark_flashmask.py: the RNG-dependent
-        # masks (Share Question, Random Eviction) then start from the same seed 0 as there.
-        for D in ([128, 192, 256] if head_dim is None else [head_dim]):
-            if D == 192:
-                DV = 128
-                H = 16
-            else:
-                DV = D
-                H = 4096 // D
-            HKV = H
-    
-            for idx, (S, prefix_doc_seq_lens, qksparse_mask) in enumerate(doc_seq_lens_list):
-                B = 128 * 1024 // S
+            print(tabulate(results, headers=bench_common.CSV_HEADERS, tablefmt="grid"))
+            print(f"wrote {out}")
+            continue
 
-                doc_seq_lens = [x[1] for x in prefix_doc_seq_lens]
-                maskout_pair = []
-                offset = 0
-                print(f"{B}_{S}_{H}_{D}_{DV}_{idx}_{dtype}")
-                if sum(qksparse_mask) == 0:
-                    maskout_pair = [(1024, 538), (2358, 1700)]
-                else:
-                    for is_maskout, doc_seq in zip(qksparse_mask, doc_seq_lens):
-                        if is_maskout:
-                            maskout_pair.append((offset, doc_seq))
-                        offset += doc_seq
+        for ex in case.masks:
+            spec = bench_common.build_mask(ex, case)
+            mask_info = make_mask_info(spec, case)
+            if check_masks:
+                fp = bench_common.fingerprint(*bench_common.torch_mask_mod_counts(
+                    mask_info["flex_mask_mod"], spec.causal, B, _mask_heads(mask_info, H), S))
+                acc = bench_common.run_accuracy(case, ex, lambda c, s, inputs: test_mask(
+                    mask_info=make_mask_info(s, c), spec=s, B=c.B, S=S, H=c.H, HKV=c.HKV, D=D, DV=DV,
+                    dtype=dtype, inputs=inputs, outputs_only=True), check_masks)
+                print(f"[acc] S={S} D={D} {ex}: {'ok' if acc is None or acc['ok'] else 'FAIL'}")
+                bench_common.append_jsonl(check_masks, bench_common.check_record("fa4", case, spec, fp, acc=acc))
+                continue
 
-                share_qa_docs = [split_sequence(doc_seq) for doc_seq in doc_seq_lens]
 
-                available_examples = {
-                    "Full": lambda: test_mask(mask_info={"cute_mask_mod": None, "flex_mask_mod": None, "aux_tensors": None, "causal": False}, B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Causal": lambda: test_mask(mask_info={"cute_mask_mod": None, "flex_mask_mod": None, "aux_tensors": None, "causal": True}, B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Sliding Window": lambda: test_mask(mask_info=generate_sliding_window(window_size=int(S*0.0625)), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Causal Document Mask": lambda: test_mask(mask_info=generate_causal_document_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    # Note(umiswing): FA4 mask_mod will hang in Document Mask, and idk why
-                    # "Document Mask": lambda: test_mask(mask_info=generate_document_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Share Question Mask": lambda: test_mask(mask_info=generate_share_question_mask(doc_seq_lens=share_qa_docs, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Global Sliding Window": lambda: test_mask(mask_info=generate_global_sliding_window_mask(global_token=16, B=B, S=S, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Causal Blockwise Mask": lambda: test_mask(mask_info=generate_causal_blockwise_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Prefix LM Document Mask": lambda: test_mask(mask_info=generate_prefix_lm_document_mask(doc_seq_lens=prefix_doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Prefix LM Causal Mask": lambda: test_mask(mask_info=generate_prefix_lm_causal_mask(prefix_length=int(S*0.5), B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "QK-sparse Mask": lambda: test_mask(mask_info=generate_qk_sparse_mask(maskout_pair=maskout_pair, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    "Random Eviction Mask": lambda: test_mask(mask_info=generate_random_eviction_mask(start_row=S//2, B=B, S=S, H=H, HKV=HKV), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                    # "Hybrid SWA Prefix LM Doc": lambda: test_mask(mask_info=generate_hybrid_swa_prefix_lm_document_mask(batch_size=B, seqlen=S, hkv=H, d=D, doc_seq_lens=prefix_doc_seq_lens), B=B, S=S, H=H, HKV=HKV, D=D, DV=DV, dtype=dtype),
-                }
-
-                if "all" in examples:
-                    ex_to_run = list(available_examples.keys())
-                else:
-                    ex_to_run = examples
-
-                results = []
-                for ex in ex_to_run:
-                    # SM100 hdim256 uses a dedicated kernel without mask_mod/block sparsity support
-                    if torch.cuda.get_device_capability()[0] in (10, 11) and D == 256 and ex not in ("Full", "Causal"):
-                        print(f"Warning: SM100 hdim256 does not support mask_mod, skipping '{ex}'.")
-                        continue
-                    if ex in available_examples:
-                        print(ex)
-                        fw_time, bw_time, total_time, fw_flops, bw_flops, total_flops, fw_tflops, bw_tflops, total_tflops, sparsity = available_examples[ex]()
-                        results.append([ex, f"{fw_time:.4f}", f"{bw_time:.4f}", f"{total_time:.4f}", f"{fw_flops:.4f}", f"{bw_flops:.4f}", f"{total_flops:.4f}", f"{fw_tflops:.4f}", f"{bw_tflops:.4f}", f"{total_tflops:4f}", f"{sparsity:.4f}"])
-                    else:
-                        print(f"Warning: Unknown example key '{ex}'. Skipping.")
-
-                # Usage in your results formatting:
-                headers = [
-                    "Operation",
-                    "FW Time (ms)",
-                    "BW Time (ms)",
-                    "TOTAL Time (ms)",
-                    "FW FLOPs",
-                    "BW FLOPs",
-                    "TOTAL FLOPs",
-                    "FW TFLOPs/s",
-                    "BW TFLOPs/s",
-                    "TOTAL TFLOPs/s",
-                    "Sparsity",
-                ]
-                print(
-                    tabulate(
-                        results,
-                        headers=headers,
-                        tablefmt="grid",
-                    )
-                )
-                content2=tabulate(results, headers=headers, tablefmt="tsv")
-                os.makedirs(f"{dtype}", exist_ok=True)
-                text_file = open(f"{dtype}/fa4_mask_mod_{current_time}_{B}_{S}_{H}_{HKV}_{D}_{DV}_{idx}.csv","w")
-                text_file.write(content2)
-                text_file.close()
 
 if __name__ == "__main__":
     try:
@@ -994,9 +867,8 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         default=["all"],
-        help="List of examples to run. Use space to separate multiple examples. "
-        "Available options: causal, alibi, sliding_window, prefix_lm, "
-        "document, softcap, softcap_approx, or 'all' to run all examples.",
+        help="Masks to run, or 'all'. Names as in bench_common.MASKS (the CSV "
+        "Operation column), e.g. 'Causal Document Mask'.",
     )
     parser.add_argument(
         "--dtype",
@@ -1017,6 +889,71 @@ if __name__ == "__main__":
         help="Timestamp used in the CSV file names (default: now), like benchmark_flashmask.py --current_time.",
     )
 
+    parser.add_argument(
+        "--dedup_static_masks",
+        action="store_true",
+        default=False,
+        help="Measure the masks that only depend on S (bench_common.S_ONLY_MASKS) on "
+        "Sample 1 of each 'Total length' block only, like benchmark_flashmask.py.",
+    )
+    parser.add_argument(
+        "--series",
+        type=str,
+        default=None,
+        help="Result series name (default fa4). CSVs go to <results_dir>/<current_time>/<series>/.",
+    )
+    parser.add_argument(
+        "--results_dir",
+        type=str,
+        default=bench_common.RESULTS_DIR,
+    )
+    parser.add_argument(
+        "--no-overwrite",
+        action="store_false",
+        dest="overwrite",
+        help="Skip the samples whose CSV for this --current_time already exists "
+        "(resume a killed run by passing its --current_time again).",
+    )
+    parser.add_argument(
+        "--interfere_grace",
+        type=float,
+        default=60.0,
+        help="Seconds another process may hold the GPU before giving up on it: with "
+        "--allow_handoff exit 75 (run_perf.sh moves the task to another aq GPU), else "
+        "keep waiting up to --interfere_max_wait. Disturbed measurements are discarded.",
+    )
+    parser.add_argument(
+        "--interfere_max_wait",
+        type=float,
+        default=1800.0,
+        help="Without --allow_handoff, fail after waiting this long for the GPU.",
+    )
+    parser.add_argument(
+        "--allow_handoff",
+        action="store_true",
+        help="Exit with code 75 when another process keeps the GPU past --interfere_grace.",
+    )
+    parser.add_argument(
+        "--seqlens",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Only these 'Total length' blocks of kernel_test_seq_info.txt, e.g. --seqlens 4096.",
+    )
+    parser.add_argument(
+        "--first_sample_only",
+        action="store_true",
+        default=False,
+        help="Run only Sample 1 of each 'Total length' block of kernel_test_seq_info.txt.",
+    )
+    parser.add_argument(
+        "--check_masks",
+        type=str,
+        default=None,
+        help="Write the mask fingerprint of every (case, mask) to this jsonl file instead "
+        "of timing; compare backends with check_bench_consistency.py.",
+    )
+
     args = parser.parse_args()
-    main(**vars(args))
+    bench_common.run_main(main, **vars(args))
 

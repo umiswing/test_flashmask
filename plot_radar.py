@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.gridspec as gridspec
 import pandas as pd
 import glob
+import os
 
 import warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
@@ -36,12 +37,46 @@ METHOD_LABELS = {
 
 COLORS = ['#39CFC5', '#FF7D5E', '#6A5ACD', '#FFA500', '#32CD32', '#FF1493', '#00CED1', '#FFD700']
 
+# kernel key -> (CSV column, axis label)
+METRICS = {
+    "fwd": ('FW TFLOPs/s', 'Fwd Speed (TFLOPs/s)'),
+    "bwd": ('BW TFLOPs/s', 'Bwd Speed (TFLOPs/s)'),
+    "total": ('TOTAL TFLOPs/s', 'Total Speed (TFLOPs/s)'),
+    "fwd_time": ('FW Time (ms)', 'FW Time (ms)'),
+    "bwd_time": ('BW Time (ms)', 'BW Time (ms)'),
+    "total_time": ('TOTAL Time (ms)', 'TOTAL Time (ms)'),
+    "sparsity": ('Sparsity', 'Sparsity'),
+}
+
+
+def method_label(method, labels=None):
+    """Display name: --labels first, then METHOD_LABELS, then the raw method name."""
+    return (labels or {}).get(method, METHOD_LABELS.get(method, method))
+
+
+def save_figure(fig, save_path):
+    """Save as <dir>/png/<name>.png and <dir>/pdf/<name>.pdf.
+
+    Returns both absolute paths, so callers can print them as-is and the terminal
+    / IDE can open them directly.
+    """
+    out_dir, name = os.path.split(save_path)
+    paths = []
+    for ext in ('png', 'pdf'):
+        sub_dir = os.path.join(out_dir, ext)
+        os.makedirs(sub_dir, exist_ok=True)
+        path = os.path.abspath(os.path.join(sub_dir, f'{name}.{ext}'))
+        fig.savefig(path, dpi=300, format=ext)
+        paths.append(path)
+    return paths
+
 
 def plot_radar_grid(rows, save_path, methods,
                     suptitle=None,
                     show_value_labels=True,
                     show_percent_label=True,
-                    show_second_label=False):
+                    show_second_label=False,
+                    method_labels=None):
     """Plot a grid of radar charts.
 
     rows: list of dicts, one per row (e.g. fwd / bwd / total), each of the form
@@ -158,7 +193,7 @@ def plot_radar_grid(rows, save_path, methods,
                                     bbox=dict(boxstyle="round,pad=0.19", fc="#f7f7f7", ec=method_color, lw=0.7, alpha=0.7))
 
     handles, legend_labels = axs[0].get_legend_handles_labels()
-    legend_labels = [METHOD_LABELS.get(label, label) for label in legend_labels]
+    legend_labels = [method_label(label, method_labels) for label in legend_labels]
 
     fig.legend(
         handles, legend_labels, loc='upper center', bbox_to_anchor=(0.5, 0.955),
@@ -170,15 +205,16 @@ def plot_radar_grid(rows, save_path, methods,
         fig.suptitle(suptitle, fontsize=13, fontproperties=font_prop, y=0.995)
 
     plt.tight_layout(rect=[0, 0, 1, 0.90])
-    plt.savefig(save_path, dpi=300)
-    plt.savefig(save_path + '.pdf', dpi=300, format='pdf')
+    paths = save_figure(fig, save_path)
     plt.close(fig)
+    return paths
 
 
 def plot_bar_grid(rows, save_path, methods,
                   suptitle=None,
                   show_value_labels=True,
-                  show_percent_label=True):
+                  show_percent_label=True,
+                  method_labels=None):
     """Grouped bar version of plot_radar_grid, same ``rows`` structure.
 
     A radar with two or three axes degenerates into a line or a triangle and is
@@ -246,7 +282,7 @@ def plot_bar_grid(rows, save_path, methods,
                 ax.spines[side].set_visible(False)
 
     handles, legend_labels = axs[0].get_legend_handles_labels()
-    legend_labels = [METHOD_LABELS.get(label, label) for label in legend_labels]
+    legend_labels = [method_label(label, method_labels) for label in legend_labels]
     fig.legend(
         handles, legend_labels, loc='upper center', bbox_to_anchor=(0.5, 0.965),
         ncol=min(len(methods), 4),
@@ -257,9 +293,9 @@ def plot_bar_grid(rows, save_path, methods,
         fig.suptitle(suptitle, fontsize=13, fontproperties=font_prop, y=0.995)
 
     plt.tight_layout(rect=[0, 0, 1, 0.93])
-    plt.savefig(save_path, dpi=300)
-    plt.savefig(save_path + '.pdf', dpi=300, format='pdf')
+    paths = save_figure(fig, save_path)
     plt.close(fig)
+    return paths
 
 
 
@@ -323,185 +359,282 @@ def parse_head_dims(head_dims):
     return pairs
 
 
-def main(methods: list = ["flashmaskv1", "flashmaskv3"],
+def series_label(path):
+    """Default legend name of a series directory: '<series> (<run>, <commit>)' from meta.json."""
+    import json
+    name = os.path.basename(os.path.normpath(path))
+    run = os.path.basename(os.path.dirname(os.path.normpath(path)))
+    extra = [run] if run else []
+    try:
+        with open(os.path.join(path, "meta.json")) as f:
+            meta = json.load(f)
+        commits = [p.get("git_commit") for p in meta.get("packages", []) if p.get("git_commit")]
+        if commits:
+            extra.append(commits[0])
+    except (OSError, ValueError):
+        pass
+    return f"{name} ({', '.join(extra)})" if extra else name
+
+
+def load_samples(root_dir, dtype, method, seqlen, headdim, headdim_v):
+    """Read every sample CSV of one method / shape into one long DataFrame.
+
+    benchmark_flashmask.py writes {method}_{B}_{S}_{H}_{HKV}_{D}_{DV}_{sample}.csv.
+    Returns (DataFrame with columns sample, op and one per METRICS key, files),
+    or (None, files) when nothing was readable.
+    """
+    if os.path.isdir(method):
+        # --series: results/<run>/<series>/{B}_{S}_{H}_{HKV}_{D}_{DV}_{sample}.csv
+        pattern = f'{method}/*_{seqlen}_*_*_{headdim}_{headdim_v}_*.csv'
+    else:
+        pattern = f'{root_dir}/{dtype}/{method}_*_{seqlen}_*_*_{headdim}_{headdim_v}_*.csv'
+    files = sorted(glob.glob(pattern))
+    frames = []
+    for path in files:
+        df = read_tsv_to_dataframe(path)
+        if df is None:
+            continue
+        frame = pd.DataFrame({
+            'sample': os.path.basename(path)[:-len('.csv')].rsplit('_', 1)[1],
+            'op': df[get_column_name(df, 'Operation')].astype(str).str.strip(),
+        })
+        for key, (col, _) in METRICS.items():
+            frame[key] = pd.to_numeric(df[get_column_name(df, col)], errors='coerce')
+        frames.append(frame)
+    if not frames:
+        return None, files
+    return pd.concat(frames, ignore_index=True), files
+
+
+def op_means(samples):
+    """Mean of every metric per Operation, plus n = number of samples averaged.
+
+    Grouped by Operation NAME, not by row position: --dedup_static_masks makes
+    benchmark_flashmask.py emit the S-only masks (Full, Causal, ...) on the first
+    sample only, so the files of one seqlen no longer share a row count or a row
+    order. A positional mean would blend different masks together.
+    """
+    grouped = samples.drop(columns='sample').groupby('op', sort=False)
+    means = grouped.mean()
+    means['n'] = grouped.size()
+    return means
+
+
+def check_sparsity(samples_by_method, tol=1e-4):
+    """Check that every method measured the same masks as the baseline.
+
+    Compares each (sample, Operation) with the first method: sparsity must agree
+    within tol and the pair must exist on both sides. A speed ratio between two
+    different masks means nothing, so callers drop the Operations listed here.
+    Returns a list of dicts: method, sample, op, kind ('mismatch' / 'missing'),
+    base (baseline sparsity), value (this method's sparsity).
+    """
+    methods = list(samples_by_method)
+    keys = ['sample', 'op', 'sparsity']
+    base = samples_by_method[methods[0]][keys]
+    issues = []
+    for method in methods[1:]:
+        merged = base.merge(samples_by_method[method][keys], on=['sample', 'op'],
+                            how='outer', suffixes=('_base', '_cmp'), indicator=True)
+        for rec in merged.to_dict('records'):
+            if rec['_merge'] != 'both':
+                kind = 'missing'
+            elif abs(rec['sparsity_base'] - rec['sparsity_cmp']) > tol:
+                kind = 'mismatch'
+            else:
+                continue
+            issues.append({'method': method, 'sample': rec['sample'], 'op': rec['op'], 'kind': kind,
+                           'base': rec['sparsity_base'], 'value': rec['sparsity_cmp']})
+    return issues
+
+
+def collect_shape(root_dir, dtype, methods, headdim, headdim_v, seqlen, sparsity_tol=1e-4):
+    """Load every method for one (head dim, seqlen) and align them for comparison.
+
+    Returns None when no method has data, else a dict with
+      means:    {method: op_means() DataFrame}
+      labels:   Operations present in all methods with matching sparsity (baseline order)
+      issues:   check_sparsity() result against the first method that has data
+      excluded: Operations dropped because of those issues
+      files:    {method: [csv paths]}
+    """
+    samples, files = {}, {}
+    for method in methods:
+        df, files[method] = load_samples(root_dir, dtype, method, seqlen, headdim, headdim_v)
+        if df is None:
+            print(f"Warning: no data for {method}, seqlen {seqlen}, head dim {headdim}/{headdim_v}")
+            continue
+        samples[method] = df
+    if not samples:
+        return None
+    means = {m: op_means(df) for m, df in samples.items()}
+    # samples keeps the methods order minus the absent ones, so the reference is the
+    # first method with data here (a series without this head dim must not skip the check).
+    issues = check_sparsity(samples, sparsity_tol)
+    excluded = sorted({rec['op'] for rec in issues})
+    first = next(iter(means))
+    labels = [op for op in means[first].index
+              if op not in excluded and all(op in means[m].index for m in means)]
+    for method, df in means.items():
+        dropped = [op for op in df.index if op not in labels and op not in excluded]
+        if dropped:
+            print(f"Note: {method} seqlen {seqlen}: categories not shared by all methods, dropped: {dropped}")
+    return {'means': means, 'labels': labels, 'issues': issues,
+            'excluded': excluded, 'files': files}
+
+
+def report_sparsity(shapes, methods, headdim, headdim_v):
+    """Print the sparsity check of one head dim; returns the number of issues."""
+    issues = [(seqlen, rec) for seqlen, shape in shapes.items() for rec in shape['issues']]
+    checked = sum(len(shape['labels']) + len(shape['excluded']) for shape in shapes.values())
+    if not issues:
+        print(f"Sparsity check [head dim {headdim}/{headdim_v}]: OK, {checked} (seqlen, Operation) "
+              f"pairs identical across {len(methods)} methods")
+        return 0
+    print(f"Sparsity check [head dim {headdim}/{headdim_v}]: {len(issues)} issue(s); "
+          f"these Operations are EXCLUDED from the comparison:")
+    for seqlen, rec in issues:
+        print(f"  seqlen {seqlen} sample {rec['sample']} {rec['op']:<24} {rec['kind']:<8} "
+              f"{methods[0]}={rec['base']} {rec['method']}={rec['value']}")
+    return len(issues)
+
+
+def build_rows(shapes, methods, kernels, headdim):
+    """rows structure of plot_radar_grid / plot_bar_grid from collect_shape() results."""
+    rows = []
+    for kernel in kernels:
+        categories = {}
+        for seqlen, shape in shapes.items():
+            item = {'labels': shape['labels'], 'xlabel': METRICS[kernel][1]}
+            for method in methods:
+                if method in shape['means']:
+                    item[method] = shape['means'][method].loc[shape['labels'], kernel].tolist()
+                else:
+                    print(f"Warning: {method} has no data at seqlen {seqlen}, head dim {headdim}: "
+                          f"plotting zeros for this seqlen")
+                    item[method] = [0] * len(shape['labels'])
+            categories[f'Sequence length {seqlen // 1024}K, head dim {headdim}'] = item
+        if categories:
+            rows.append({'row_label': kernel, 'categories': categories})
+    return rows
+
+
+def main(methods: list = None,
+         series: list = None,
          head_dims: list = [128, 192, 256],
          seqlens: list = [4096, 8192, 32768, 65536, 131072],
-         chart: str = "radar"):
+         chart: str = "radar",
+         labels: list = None,
+         root_dir: str = '.',
+         out_dir: str = './fig',
+         sparsity_tol: float = 1e-4):
     plt.rcParams['font.family'] = "DejaVu Sans"
+    if series:
+        if methods:
+            raise ValueError("pass either --series (result directories) or --methods (old bf16/ layout)")
+        missing = [d for d in series if not os.path.isdir(d)]
+        if missing:
+            raise ValueError(f"--series: not a directory: {missing}")
+        methods = list(series)
+        if not labels:
+            labels = [series_label(d) for d in series]
+    methods = methods or ["flashmaskv1", "flashmaskv3"]
     print("Drawing radar plot with : ", methods)
-
-    root_dir = '.'
+    if labels and len(labels) != len(methods):
+        raise ValueError(f"--labels needs one name per method ({len(methods)}), got {len(labels)}")
+    display = dict(zip(methods, labels)) if labels else None
     kernels = ["fwd", "bwd", "total"]
-    kernel_xlabel = {
-        "fwd": 'Fwd Speed (TFLOPs/s)',
-        "bwd": 'Bwd Speed (TFLOPs/s)',
-        "total": 'Total Speed (TFLOPs/s)',
-        "fwd_time": 'FW Time (ms)',
-        "bwd_time": 'BW Time (ms)',
-        "total_time": 'TOTAL Time (ms)',
-        "sparsity": 'Sparsity',
-    }
-    kernel_metric_col = {
-        "fwd": 'FW TFLOPs/s',
-        "bwd": 'BW TFLOPs/s',
-        "total": 'TOTAL TFLOPs/s',
-        "fwd_time": 'FW Time (ms)',
-        "bwd_time": 'BW Time (ms)',
-        "total_time": 'TOTAL Time (ms)',
-        "sparsity": 'Sparsity',
-    }
+    saved = []
 
     for dtype in ['bf16']:
         for headdim, headdim_v in parse_head_dims(head_dims):
-            rows = []
-            # for kernel in ["fwd", "bwd", "total", "fwd_time", "bwd_time", "total_time", "sparsity"]:
-            for kernel in kernels:
-                categories = {}
-                for seqlen in seqlens:
-                    method_to_df = {}
-                    metric = None
-                    non_numeric_column = None
-                    for method in methods:
-                        filenames = glob.glob(f'{root_dir}/{dtype}/{method}_*{seqlen}_*_{headdim}_{headdim_v}*.csv')
-                        dataframes = []
-                        for file_path in filenames:
-                            df = read_tsv_to_dataframe(file_path)
-                            if df is not None:
-                                dataframes.append(df)
-
-                        print(f"Method {method}, files: {filenames}")
-                        if not dataframes:
-                            print(f"Warning: No data found for method {method}, sequence length {seqlen}")
-                            continue
-
-                        df = dataframes[0]
-                        non_numeric_column = get_column_name(df, 'Operation')
-                        metric = get_column_name(df, kernel_metric_col[kernel])
-
-                        # Average across the samples of this seqlen by Operation
-                        # NAME, not by row position: --dedup_static_masks makes
-                        # benchmark_flashmask.py emit the S-only masks (Full,
-                        # Causal, ...) on the first sample only, so the files of
-                        # one seqlen no longer share a row count or a row order.
-                        # A positional mean would blend different masks together
-                        # and then label them from the first file.
-                        frames = []
-                        for d in dataframes:
-                            frames.append(pd.DataFrame({
-                                non_numeric_column: d[get_column_name(d, 'Operation')].astype(str).str.strip(),
-                                metric: pd.to_numeric(d[get_column_name(d, kernel_metric_col[kernel])], errors='coerce'),
-                            }))
-                        combined_data = pd.concat(frames, axis=0, ignore_index=True)
-                        grouped = combined_data.groupby(non_numeric_column, sort=False)
-                        mean_df = grouped[metric].mean().reset_index()
-                        counts = grouped[metric].count()
-                        if counts.nunique() > 1:
-                            print(f"Note: Method {method} seqlen {seqlen} averaged an "
-                                  f"uneven number of samples per Operation "
-                                  f"(expected with --dedup_static_masks): "
-                                  f"{counts.to_dict()}")
-                        method_to_df[method] = mean_df
-                        print('='*20)
-                        print(f"Method {method} data:")
-                        print(mean_df)
-
-                    if not method_to_df:
-                        print(f"Error: No data found for sequence length {seqlen}")
-                        continue
-
-                    one_item = {}
-                    # Align categories by Operation name across methods, since
-                    # different benchmarks produce different mask category sets
-                    # (e.g. flashmask has "Document Mask" but fa4_mask_mod has
-                    # "Global Sliding Window"). Positional alignment would silently
-                    # mismatch values. Build op -> metric maps and keep only the
-                    # categories shared by all present methods.
-                    op2val = {}
-                    for method, mean_df in method_to_df.items():
-                        op2val[method] = {
-                            op.strip(): val
-                            for op, val in zip(
-                                mean_df[non_numeric_column].tolist(),
-                                mean_df[metric].tolist(),
-                            )
-                        }
-
-                    first_method = list(method_to_df.keys())[0]
-                    first_labels = [op.strip() for op in method_to_df[first_method][non_numeric_column].tolist()]
-                    common_labels = [
-                        lbl for lbl in first_labels
-                        if all(lbl in op2val[m] for m in method_to_df)
-                    ]
-
-                    for method in method_to_df:
-                        dropped = [lbl for lbl in op2val[method] if lbl not in common_labels]
-                        if dropped:
-                            print(f"Note: Method {method} categories dropped (not shared by all methods): {dropped}")
-
-                    one_item['labels'] = common_labels
-
-                    for method in methods:
-                        if method in method_to_df:
-                            one_item[method] = [op2val[method][lbl] for lbl in common_labels]
-                        else:
-                            print(f"Warning: Method {method} not found in data, using zeros")
-                            one_item[method] = [0] * len(common_labels)
-
-                    one_item['xlabel'] = kernel_xlabel[kernel]
-
-                    categories[f'Sequence length {seqlen // 1024}K, head dim {headdim}'] = one_item
-
-                if categories:
-                    rows.append({'row_label': kernel, 'categories': categories})
-                else:
-                    print(f"Warning: No categories data for {dtype}_{headdim}_{kernel}")
-
-            if not rows:
+            shapes = {}
+            for seqlen in seqlens:
+                shape = collect_shape(root_dir, dtype, methods, headdim, headdim_v, seqlen, sparsity_tol)
+                if shape is None:
+                    print(f"Error: No data found for sequence length {seqlen}")
+                    continue
+                shapes[seqlen] = shape
+                print(f"[head dim {headdim}/{headdim_v}, seqlen {seqlen}] "
+                      + ", ".join(f"{m}: {len(f)} files" for m, f in shape['files'].items()))
+            if not shapes:
                 print(f"Warning: No data for {dtype}_{headdim}, skip figure")
                 continue
+            # Series that have no CSV at all for this head dim (e.g. fa4 / cudnn at
+            # 576/512, kvshared at 128) are left out of this figure instead of being
+            # drawn as zeros; the baseline is the first series that has data.
+            present = [m for m in methods if any(m in s['means'] for s in shapes.values())]
+            absent = [m for m in methods if m not in present]
+            if absent:
+                print(f"Note: head dim {headdim}/{headdim_v}: skip "
+                      f"{', '.join(method_label(m, display) for m in absent)} (no CSV)")
+            n_issues = report_sparsity(shapes, present, headdim, headdim_v)
+            n_excluded = sum(len(shape['excluded']) for shape in shapes.values())
+            rows = build_rows(shapes, present, kernels, headdim)
 
             # --- output improvement percentage: total only ---
-            records, a, b = compute_improvement_range(rows, methods)
+            records, a, b = compute_improvement_range(rows, present)
             suptitle = None
             total_records = [rec for rec in records if rec['kernel'] == 'total']
             if total_records:
                 total_incs = [rec['inc_pct'] for rec in total_records]
                 a, b = min(total_incs), max(total_incs)
                 print('#' * 40)
-                print(f"[headdim={headdim}] TOTAL improvement of '{methods[-1]}' over baseline '{methods[0]}':")
+                print(f"[headdim={headdim}] TOTAL improvement of '{present[-1]}' over baseline '{present[0]}':")
                 for rec in total_records:
                     print(f"  {rec['category']} | {rec['op']:<24} {rec['inc_pct']:+.1f}%")
                 print(f"  total improvement range: {a:+.1f}% ~ {b:+.1f}%")
                 print('#' * 40)
-                suptitle = (f"{methods[0]} vs {methods[-1]}  |  dtype={dtype}, head dim={headdim}  |  "
+                suptitle = (f"{method_label(present[0], display)} vs {method_label(present[-1], display)}  |  "
+                            f"dtype={dtype}, head dim={headdim}  |  "
                             f"total improvement range: {a:+.1f}% ~ {b:+.1f}%")
+                if n_issues:
+                    suptitle += f"  |  sparsity mismatch: {n_excluded} op(s) excluded"
 
-            methods_str = "_vs_".join(methods)
+            methods_str = "_vs_".join(
+                "-".join(os.path.normpath(m).split(os.sep)[-2:]) if os.path.isdir(m) else m
+                for m in present)
             kind = 'radar' if chart == 'radar' else 'bar'
-            save_path = f'{root_dir}/fig/{methods_str}_{dtype}_{headdim}_{headdim_v}_fwd_bwd_total_{kind}'
+            save_path = os.path.join(out_dir, f'{methods_str}_{dtype}_{headdim}_{headdim_v}_fwd_bwd_total_{kind}')
             plot_fn = plot_radar_grid if chart == 'radar' else plot_bar_grid
-            plot_fn(rows, save_path, methods,
-                    suptitle=suptitle,
-                    show_value_labels=True, show_percent_label=True)
-            print(f"Saved figure: {save_path}(.pdf)")
+            paths = plot_fn(rows, save_path, present,
+                            suptitle=suptitle,
+                            show_value_labels=True, show_percent_label=True,
+                            method_labels=display)
+            for path in paths:
+                print(f"Saved figure: {path}")
+            saved.extend(paths)
+    return saved
+
 
 if __name__ == "__main__":
     from jsonargparse import ArgumentParser
     parser = ArgumentParser(description="Run specific examples or all examples.")
 
     parser.add_argument(
+        "--series",
+        type=str,
+        nargs='+',
+        default=None,
+        help="Result directories to compare, first one is the baseline, e.g. "
+        "results/20261109_0900/fm4 results/20261110_1200/fm4 results/20261110_1200/fa4. "
+        "Legend defaults to '<series> (<run>, <commit>)' from each meta.json."
+    )
+
+    parser.add_argument(
         "--methods",
         type=str,
         nargs='+',
-        default=["flexattention", "flashmaskv3"],
-        help="List of methods to compare (e.g., flashmaskv1 flashmaskv3 flexattention)"
+        default=None,
+        help="Old layout: method prefixes under <root_dir>/<dtype>/ "
+        "(e.g. flashmaskv1 flashmaskv3 flexattention). Use --series for results/ runs."
     )
 
     parser.add_argument(
         "--head_dims",
         type=str,
         nargs='+',
-        default=["128", "192", "256", "576,512"],
+        default=["128", "192", "256", "512,512", "576,512"],
         help="Head dims to plot. '128' derives dv from d (dv == d, 192 -> 128); "
         "'576,512' gives d and dv explicitly, which is required for the "
         "MLA-shaped runs where dv cannot be derived."
@@ -521,6 +654,37 @@ if __name__ == "__main__":
         default="radar",
         help="'radar' (default) or 'bar'. Prefer 'bar' when only two or three "
         "Operations are shared across methods -- a 2-axis radar is just a line."
+    )
+
+    parser.add_argument(
+        "--labels",
+        type=str,
+        nargs='+',
+        default=None,
+        help="Display names for --methods, same order (e.g. base new). "
+        "Defaults to METHOD_LABELS or the raw method name."
+    )
+
+    parser.add_argument(
+        "--root_dir",
+        type=str,
+        default=".",
+        help="Directory holding the <dtype>/ CSV folders."
+    )
+
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default="./fig",
+        help="Figures go to <out_dir>/png/ and <out_dir>/pdf/."
+    )
+
+    parser.add_argument(
+        "--sparsity_tol",
+        type=float,
+        default=1e-4,
+        help="Max allowed |sparsity difference| per (sample, Operation) between "
+        "a method and the baseline; Operations beyond it are excluded."
     )
 
     args = parser.parse_args()
