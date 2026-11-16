@@ -10,7 +10,8 @@
 #
 #   PY        python with flashmask (default python3)
 #   AQ_ARGS   extra aq submit args, e.g. "--any"
-#   FA_VERSION  4 (SM100, default) or 3 (SM90): picks the shards and the GT file
+#   FA_VERSION  4 (SM100) or 3 (SM90): picks the shards and the GT file; default from this
+#               machine's GPU, recorded in aadiff/<id>/fa_version for status / result
 #
 # One 1-GPU task per (d, dv, kv_mode) shard. A case missing from the GT fails. Results in
 # aadiff/<id>/: <shard>.log (pytest), <shard>.xml (junit), <shard>.rc, and with REGEN_GT=1
@@ -20,17 +21,23 @@ set -o pipefail
 cd "$(dirname "$0")" || exit 1
 REPO=$(pwd)
 PY="${PY:-python3}"
-FA_VERSION="${FA_VERSION:-4}"
-GT="$REPO/flashmask_gt_fa$FA_VERSION.json"
 
 die() { echo "error: $*" >&2; exit 1; }
+
+detect_fa_version() {   # same rule as test_util.detect_fa_versions: sm100+ -> 4, sm90 -> 3
+    local cap
+    cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)
+    [ -n "$cap" ] || die "cannot read the GPU compute capability; set FA_VERSION=3 or 4"
+    if [ "${cap%%.*}" -ge 10 ]; then echo 4; else echo 3; fi
+}
+
+FA_VERSION="${FA_VERSION:-$(detect_fa_version)}" || exit 1
+GT="$REPO/flashmask_gt_fa$FA_VERSION.json"
 
 shards() {   # d,dv,kv_mode (same lists as test_md5sum.py)
     local s
     for s in 64,64 80,80 128,128 192,128 256,256; do echo "$s,split"; done
-    if [ "$FA_VERSION" = "4" ]; then
-        echo "512,512,split"; echo "576,512,split"; echo "512,512,shared"; echo "576,512,shared"
-    fi
+    echo "512,512,split"; echo "576,512,split"; echo "512,512,shared"; echo "576,512,shared"
 }
 
 active_tasks() {   # ids of this user's queued / running tasks
@@ -58,6 +65,10 @@ print("\n".join(sorted(ids)))'
 load() {
     id=$1; OUT="$REPO/aadiff/$id"
     [ -n "$id" ] && [ -f "$OUT/jobs.tsv" ] || die "no aadiff run '$id' ($OUT/jobs.tsv)"
+    if [ -f "$OUT/fa_version" ]; then
+        FA_VERSION=$(cat "$OUT/fa_version")
+        GT="$REPO/flashmask_gt_fa$FA_VERSION.json"
+    fi
 }
 
 cmd=submit
@@ -71,6 +82,7 @@ submit)
     mkdir -p "$OUT"
     mode=check; [ "$REGEN_GT" = 1 ] && mode=regen
     echo "$mode" > "$OUT/mode"
+    echo "$FA_VERSION" > "$OUT/fa_version"
     # The GT is recorded and checked under the same flags (see AADIFF_FLAGS in test_md5sum.py).
     flags="export FLAGS_cudnn_deterministic=1 FLAGS_alloc_fill_value=255 FLAGS_use_system_allocator=1 FLAGS_check_cuda_error=1"
     for s in $(shards); do
@@ -133,15 +145,24 @@ PY
     [ "$failed" = 1 ] && die "FAIL (aadiff $id)"
     if [ "$mode" = regen ]; then
         # Every shard recorded and re-checked: merge the shard GTs and replace the committed one.
-        python3 - "$OUT" "$GT" <<'PY'
+        python3 - "$OUT" "$GT" "$FA_VERSION" <<'PY' || die "GT not written (aadiff $id)"
 import glob, json, os, shutil, sys
-out, gt = sys.argv[1], sys.argv[2]
+out, gt, fa = sys.argv[1], sys.argv[2], int(sys.argv[3])
 merged, metas = {}, []
 for f in sorted(glob.glob(os.path.join(out, "gt_*.json"))):
     with open(f) as fh:
         d = json.load(fh)
-    metas.append(d.pop("gt_meta", {}))
+    m = d.pop("gt_meta", {})
+    if not d:   # every case unsupported on this arch
+        continue
+    # A task that ran on another GPU arch (aq --any) recorded another kernel's hashes.
+    if m.get("fa_versions") != [fa]:
+        sys.exit(f"{f}: recorded with fa_versions={m.get('fa_versions')} on {m.get('gpu')}, "
+                 f"expected [{fa}] for {gt}")
+    metas.append(m)
     merged.update(d)
+if not merged:
+    sys.exit(f"no recorded cases in {out}")
 meta = dict(metas[0]) if metas else {}
 meta["shard"] = None
 meta["shards"] = [m.get("shard") for m in metas]
