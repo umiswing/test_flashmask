@@ -204,36 +204,24 @@ def _generate_shape_params():
 def test_flashmask(
     batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, nheads_startend_row_indices, sink_dtype, kv_mode, fa_version, dtype, gen_startend_row_indices, softcap=0.0
 ):
-    paddle.seed(2026)
+    paddle.seed(2027)
     assert nheads % nheads_kv == 0
 
     # KV shared: k and v are ONE buffer (the MLA convention, v = k[..., :dv]).
-    # Only the fa4 cutedsl big-headdim backward merges dK/dV, and only for the
-    # (d, dv) pairs above -- anywhere else "shared" would just re-run the split
-    # path with a different allocation.
+    # The fa4 cutedsl big-headdim backward merges dK/dV in the kernel; the fa3
+    # (SM90) cutedsl kernels compute dK and dV separately and autograd adds them
+    # into k.grad. Only the (d, dv) pairs above -- anywhere else "shared" would
+    # just re-run the split path with a different allocation.
     kv_shared = kv_mode == "shared"
     if kv_shared and (d, dv) not in KV_SHARED_D_DV:
         pytest.skip(f"Skipping kv shared for d{d}-dv{dv}: merge not implemented")
-    if kv_shared and fa_version != 4:
-        pytest.skip("Skipping kv shared on fa2/fa3: no big-headdim cutedsl backward")
-
-    flashmask_impl = (fa_version == 3 or fa_version == 4)
-
-    # Only the fa4 cutedsl kernels handle head_dim > 256 (the big-headdim split path);
-    # fa2/fa3 have no such kernel and would fall back / fail.
-    if fa_version != 4 and max(d, dv) > 256:
-        pytest.skip(f"Skipping d{d}-dv{dv} on fa{fa_version}: head_dim > 256 is fa4 only")
 
     startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
 
     if (batch_size, seqlen_q, seqlen_k, nheads, nheads_kv) == (2, 7600, 7600, 32, 8) and fa_version == 3:
         pytest.skip("Skipping (2,7600,7600,32,8) on fa3 due to OOM")
 
-    if (fa_version == 2 or (d == 192 and dv == 192)) and seqlen_q != seqlen_k and causal:
-        # fa3/fa4 fallback to fa2
-        pytest.skip(f"Skipping because running fa2 in causal when seqlen_q != seqlen_k")
-
-    use_sink = flashmask_impl and not (d == 192 and dv == 192)
+    use_sink = True
 
     q_ref = paddle.randn(shape=[batch_size, seqlen_q, nheads, d], dtype=dtype)
     k_ref = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, d], dtype=dtype)

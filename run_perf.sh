@@ -45,7 +45,10 @@ PY_FM_BASE="${PY_FM_BASE:-}"              # baseline flashmask (paddle), e.g. /p
 PY_FA4="${PY_FA4:-}"                      # FA4 (flash_attn.cute, torch), e.g. /path/fa4/bin/python
 PY_CUDNN="${PY_CUDNN:-}"                  # cuDNN Flex (torch), e.g. /path/cudnn/bin/python
 
-SHARED=/root/paddlejob/share-storage/
+# Shared storage that other machines also mount (H: /root/paddlejob/system-public,
+# B: /root/paddlejob/share-storage/gpfs/system-public): default is the mount point holding REPO.
+SHARED="${SHARED:-$(df -P "$REPO" 2>/dev/null | awk 'NR == 2 {print $6}')}"
+SHARED="${SHARED%/}"
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -180,11 +183,12 @@ load_run() {
 check_shared_paths() {   # --any sends tasks to other machines: everything must be on shared storage
     [[ " $AQ_ARGS " == *" --any "* ]] || return 0
     local p
+    [ -n "$SHARED" ] || die "--any: $REPO is on the local disk; set SHARED=<shared mount>"
     for p in "$REPO" "$RESULTS"; do
-        [[ "$p" == "$SHARED"* ]] || die "--any needs $p on $SHARED (other machines cannot see it)"
+        [[ "$p/" == "$SHARED/"* ]] || die "--any needs $p on $SHARED (other machines cannot see it)"
     done
     for p in "$@"; do
-        [[ "$(command -v "$p")" == "$SHARED"* ]] || echo "warning: $p is not on $SHARED; other machines must have the same python" >&2
+        [[ "$(command -v "$p")/" == "$SHARED/"* ]] || echo "warning: $p is not on $SHARED; other machines must have the same python" >&2
     done
 }
 
