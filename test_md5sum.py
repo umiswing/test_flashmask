@@ -120,12 +120,8 @@ def unsupported_reason(fa_version, d, dv, kv_mode, **_):
     """Why a case is not run at all (skipped before the GT is consulted), or None."""
     # Only the fa4 cutedsl kernels handle head_dim > 256 (the big-headdim split path);
     # fa2/fa3 have no such kernel and would fall back / fail.
-    if fa_version != 4 and max(d, dv) > 256:
-        return f"d{d}-dv{dv} on fa{fa_version}: head_dim > 256 is fa4 only"
     if kv_mode == "shared" and (d, dv) not in KV_SHARED_D_DV:
         return f"kv shared for d{d}-dv{dv}: merge not implemented"
-    if kv_mode == "shared" and fa_version != 4:
-        return "kv shared on fa2/fa3: no big-headdim cutedsl backward"
     return None
 
 

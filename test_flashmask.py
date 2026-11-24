@@ -208,32 +208,20 @@ def test_flashmask(
     assert nheads % nheads_kv == 0
 
     # KV shared: k and v are ONE buffer (the MLA convention, v = k[..., :dv]).
-    # Only the fa4 cutedsl big-headdim backward merges dK/dV, and only for the
-    # (d, dv) pairs above -- anywhere else "shared" would just re-run the split
-    # path with a different allocation.
+    # The fa4 cutedsl big-headdim backward merges dK/dV in the kernel; the fa3
+    # (SM90) cutedsl kernels compute dK and dV separately and autograd adds them
+    # into k.grad. Only the (d, dv) pairs above -- anywhere else "shared" would
+    # just re-run the split path with a different allocation.
     kv_shared = kv_mode == "shared"
     if kv_shared and (d, dv) not in KV_SHARED_D_DV:
         pytest.skip(f"Skipping kv shared for d{d}-dv{dv}: merge not implemented")
-    if kv_shared and fa_version != 4:
-        pytest.skip("Skipping kv shared on fa2/fa3: no big-headdim cutedsl backward")
-
-    flashmask_impl = (fa_version == 3 or fa_version == 4)
-
-    # Only the fa4 cutedsl kernels handle head_dim > 256 (the big-headdim split path);
-    # fa2/fa3 have no such kernel and would fall back / fail.
-    if fa_version != 4 and max(d, dv) > 256:
-        pytest.skip(f"Skipping d{d}-dv{dv} on fa{fa_version}: head_dim > 256 is fa4 only")
 
     startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
 
     if (batch_size, seqlen_q, seqlen_k, nheads, nheads_kv) == (2, 7600, 7600, 32, 8) and fa_version == 3:
         pytest.skip("Skipping (2,7600,7600,32,8) on fa3 due to OOM")
 
-    if (fa_version == 2 or (d == 192 and dv == 192)) and seqlen_q != seqlen_k and causal:
-        # fa3/fa4 fallback to fa2
-        pytest.skip(f"Skipping because running fa2 in causal when seqlen_q != seqlen_k")
-
-    use_sink = flashmask_impl and not (d == 192 and dv == 192)
+    use_sink = True
 
     q_ref = paddle.randn(shape=[batch_size, seqlen_q, nheads, d], dtype=dtype)
     k_ref = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, d], dtype=dtype)
@@ -293,13 +281,14 @@ def test_flashmask(
         sink_bf16 = None
         sink = None
 
-    out_ref, attn_ref = attention_ref(
+    out_ref, attn_ref, p_sink_ref = attention_ref(
         q_ref,
         k_ref,
         v_ref,
         causal=causal,
         attn_bias=attn_bias,
         learnable_sink=sink_ref,
+        return_p_sink=True,
     )
 
     out_bf16, attn_bf16 = attention_ref(
@@ -401,22 +390,40 @@ def test_flashmask(
         print(f"Paddle naive bf16 dSink max diff: {(sink_bf16.grad - sink_ref.grad).abs().max().item()}")
         print(f"Paddle naive bf16 dSink mean diff: {(sink_bf16.grad - sink_ref.grad).abs().mean().item()}")
 
-        delta = (out_ref * g).sum(-1)                                      # (b, sq, h)
-        delta = delta.transpose([0, 2, 1])                                 # (b, h, sq)
-        p_sink = 1.0 - attn_ref.sum(-1)
+        # The dominant dsink error is the bf16 rounding of O inside the kernel's
+        # dpsum = sum_d O*dO: the kernel consumes the bf16-stored O while the
+        # autograd reference differentiates the fp32 attention graph. Element
+        # roundings are ~independent, so combine per-head by quadrature instead
+        # of the linear bound sum p*|delta| (that one over-estimates by ~sqrt(N)
+        # and goes loose on large shapes). Add an fp32 accumulation term and the
+        # 1-ulp rounding of the sink-dtype gradient.
+        U = {paddle.bfloat16: 2**-8, paddle.float16: 2**-11, paddle.float32: 2**-24}
+        EPS32 = 2**-23
 
-        err_scale = (p_sink * delta.abs()).sum(axis=[0, 2]).astype(paddle.float32)   # (h,)
+        # no_grad: out_ref still requires grad, so without it every temporary below
+        # stays pinned by the autograd graph until the test returns (og alone is
+        # b*sq*h*dv fp32, ~3 GB for the 2840-batch dv512 case).
+        with paddle.no_grad():
+            og = out_ref.astype("float32") * g.astype("float32")             # (b, sq, h, dv)
+            abs_row = og.abs().sum(-1).transpose([0, 2, 1])                  # (b, h, sq)
+            sq_row = (og * og).sum(-1).transpose([0, 2, 1])                  # (b, h, sq)
+            del og
+            p = p_sink_ref.astype("float32")                                 # (b, h, sq)
+            sigma = U[dtype] / math.sqrt(3.0) * (p * p * sq_row).sum(axis=[0, 2]).sqrt()  # (h,)
+            abs_sum = (p * abs_row).sum(axis=[0, 2])                         # (h,)
+            ref = sink_ref.grad.astype("float32")                            # (h,)
 
-        # Compare in fp32: sink may be fp16/bf16/fp32, err_scale comes from bf16 attn_ref
-        dsink_diff = (
-            sink.grad.astype(paddle.float32) - sink_ref.grad.astype(paddle.float32)
-        ).abs()
-        dsink_tol = 1e-2 + rtol * 2**-8 * err_scale
+            dsink_diff = (sink.grad.astype("float32") - ref).abs()
+            dsink_tol = 8 * sigma + 16 * EPS32 * abs_sum + 2 * U[sink_dtype] * ref.abs()
+            dsink_ratio = dsink_diff / paddle.clip(sigma, min=1e-30)
+            # Report the head furthest past its own tolerance, not independent maxima.
+            worst = int((dsink_diff - dsink_tol).argmax().item())
+        print(f"dsink diff/sigma max: {dsink_ratio.max().item():.2f} (head {int(dsink_ratio.argmax().item())})")
         assert bool((dsink_diff <= dsink_tol).all().item()), (
-            f"dsink mismatch (sink dtype={sink_dtype}): "
-            f"max_diff={dsink_diff.max().item():.6f}, "
-            f"max_tol={dsink_tol.max().item():.6f}, "
-            f"err_scale_max={err_scale.max().item():.4f}"
+            f"dsink mismatch (sink dtype={sink_dtype}), worst head {worst}: "
+            f"diff={dsink_diff[worst].item():.6f} > tol={dsink_tol[worst].item():.6f} "
+            f"(sigma={sigma[worst].item():.6f}, diff/sigma={dsink_ratio[worst].item():.2f}); "
+            f"{int((dsink_diff > dsink_tol).sum().item())}/{dsink_diff.shape[0]} heads over tolerance"
         )
 
     paddle.device.cuda.empty_cache()

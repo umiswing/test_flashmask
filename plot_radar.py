@@ -71,8 +71,36 @@ def save_figure(fig, save_path):
     return paths
 
 
+def draw_header(fig, handles, legend_labels, ncol, title=None, subtitle=None, gap=0.5):
+    """Bold title, grey subtitle, then a bold legend, stacked at the top of fig.
+
+    Positions are given in inches from the top edge and converted to figure
+    fractions, so the radar grid and the shorter bar grid get the same spacing.
+    Returns the figure fraction below which the subplots may be laid out; gap
+    (inches) is the room left under the legend for per-axes labels drawn
+    outside the axes, such as the radar FWD / BWD / TOTAL tags.
+    """
+    height = fig.get_figheight()
+    y = 0.15
+    if title:
+        fig.text(0.5, 1 - y / height, title, ha='center', va='top',
+                 fontsize=22, fontweight='bold')
+        y += 0.5
+    if subtitle:
+        fig.text(0.5, 1 - y / height, subtitle, ha='center', va='top',
+                 fontsize=13, color='#555555')
+        y += 0.35
+    fig.legend(
+        handles, legend_labels, loc='upper center', bbox_to_anchor=(0.5, 1 - y / height),
+        ncol=ncol, prop={'size': 14, 'weight': 'bold'}, frameon=False
+    )
+    y += gap
+    return 1 - y / height
+
+
 def plot_radar_grid(rows, save_path, methods,
-                    suptitle=None,
+                    title=None,
+                    subtitle=None,
                     show_value_labels=True,
                     show_percent_label=True,
                     show_second_label=False,
@@ -194,24 +222,18 @@ def plot_radar_grid(rows, save_path, methods,
 
     handles, legend_labels = axs[0].get_legend_handles_labels()
     legend_labels = [method_label(label, method_labels) for label in legend_labels]
+    top = draw_header(fig, handles, legend_labels, min(len(methods), 4),
+                      title=title, subtitle=subtitle, gap=0.8)
 
-    fig.legend(
-        handles, legend_labels, loc='upper center', bbox_to_anchor=(0.5, 0.955),
-        ncol=min(len(methods), 4),
-        prop=font_prop.copy().set_size(12), frameon=False
-    )
-
-    if suptitle:
-        fig.suptitle(suptitle, fontsize=13, fontproperties=font_prop, y=0.995)
-
-    plt.tight_layout(rect=[0, 0, 1, 0.90])
+    plt.tight_layout(rect=[0, 0, 1, top])
     paths = save_figure(fig, save_path)
     plt.close(fig)
     return paths
 
 
 def plot_bar_grid(rows, save_path, methods,
-                  suptitle=None,
+                  title=None,
+                  subtitle=None,
                   show_value_labels=True,
                   show_percent_label=True,
                   method_labels=None):
@@ -283,16 +305,10 @@ def plot_bar_grid(rows, save_path, methods,
 
     handles, legend_labels = axs[0].get_legend_handles_labels()
     legend_labels = [method_label(label, method_labels) for label in legend_labels]
-    fig.legend(
-        handles, legend_labels, loc='upper center', bbox_to_anchor=(0.5, 0.965),
-        ncol=min(len(methods), 4),
-        prop=font_prop.copy().set_size(12), frameon=False
-    )
+    top = draw_header(fig, handles, legend_labels, min(len(methods), 4),
+                      title=title, subtitle=subtitle)
 
-    if suptitle:
-        fig.suptitle(suptitle, fontsize=13, fontproperties=font_prop, y=0.995)
-
-    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    plt.tight_layout(rect=[0, 0, 1, top])
     paths = save_figure(fig, save_path)
     plt.close(fig)
     return paths
@@ -574,7 +590,7 @@ def main(methods: list = None,
 
             # --- output improvement percentage: total only ---
             records, a, b = compute_improvement_range(rows, present)
-            suptitle = None
+            title = subtitle = None
             total_records = [rec for rec in records if rec['kernel'] == 'total']
             if total_records:
                 total_incs = [rec['inc_pct'] for rec in total_records]
@@ -585,11 +601,12 @@ def main(methods: list = None,
                     print(f"  {rec['category']} | {rec['op']:<24} {rec['inc_pct']:+.1f}%")
                 print(f"  total improvement range: {a:+.1f}% ~ {b:+.1f}%")
                 print('#' * 40)
-                suptitle = (f"{method_label(present[0], display)} vs {method_label(present[-1], display)}  |  "
-                            f"dtype={dtype}, head dim={headdim}  |  "
-                            f"total improvement range: {a:+.1f}% ~ {b:+.1f}%")
+                # Title names the compared series first, the baseline last.
+                title = f"{method_label(present[-1], display)} vs {method_label(present[0], display)}"
+                subtitle = (f"{dtype.upper()}  ·  d/dv = {headdim}/{headdim_v}  ·  "
+                            f"total improvement: {a:+.1f}% ~ {b:+.1f}%")
                 if n_issues:
-                    suptitle += f"  |  sparsity mismatch: {n_excluded} op(s) excluded"
+                    subtitle += f"  ·  sparsity mismatch: {n_excluded} op(s) excluded"
 
             methods_str = "_vs_".join(
                 "-".join(os.path.normpath(m).split(os.sep)[-2:]) if os.path.isdir(m) else m
@@ -598,7 +615,7 @@ def main(methods: list = None,
             save_path = os.path.join(out_dir, f'{methods_str}_{dtype}_{headdim}_{headdim_v}_fwd_bwd_total_{kind}')
             plot_fn = plot_radar_grid if chart == 'radar' else plot_bar_grid
             paths = plot_fn(rows, save_path, present,
-                            suptitle=suptitle,
+                            title=title, subtitle=subtitle,
                             show_value_labels=True, show_percent_label=True,
                             method_labels=display)
             for path in paths:
