@@ -281,13 +281,14 @@ def test_flashmask(
         sink_bf16 = None
         sink = None
 
-    out_ref, attn_ref = attention_ref(
+    out_ref, attn_ref, p_sink_ref = attention_ref(
         q_ref,
         k_ref,
         v_ref,
         causal=causal,
         attn_bias=attn_bias,
         learnable_sink=sink_ref,
+        return_p_sink=True,
     )
 
     out_bf16, attn_bf16 = attention_ref(
@@ -389,22 +390,40 @@ def test_flashmask(
         print(f"Paddle naive bf16 dSink max diff: {(sink_bf16.grad - sink_ref.grad).abs().max().item()}")
         print(f"Paddle naive bf16 dSink mean diff: {(sink_bf16.grad - sink_ref.grad).abs().mean().item()}")
 
-        delta = (out_ref * g).sum(-1)                                      # (b, sq, h)
-        delta = delta.transpose([0, 2, 1])                                 # (b, h, sq)
-        p_sink = 1.0 - attn_ref.sum(-1)
+        # The dominant dsink error is the bf16 rounding of O inside the kernel's
+        # dpsum = sum_d O*dO: the kernel consumes the bf16-stored O while the
+        # autograd reference differentiates the fp32 attention graph. Element
+        # roundings are ~independent, so combine per-head by quadrature instead
+        # of the linear bound sum p*|delta| (that one over-estimates by ~sqrt(N)
+        # and goes loose on large shapes). Add an fp32 accumulation term and the
+        # 1-ulp rounding of the sink-dtype gradient.
+        U = {paddle.bfloat16: 2**-8, paddle.float16: 2**-11, paddle.float32: 2**-24}
+        EPS32 = 2**-23
 
-        err_scale = (p_sink * delta.abs()).sum(axis=[0, 2]).astype(paddle.float32)   # (h,)
+        # no_grad: out_ref still requires grad, so without it every temporary below
+        # stays pinned by the autograd graph until the test returns (og alone is
+        # b*sq*h*dv fp32, ~3 GB for the 2840-batch dv512 case).
+        with paddle.no_grad():
+            og = out_ref.astype("float32") * g.astype("float32")             # (b, sq, h, dv)
+            abs_row = og.abs().sum(-1).transpose([0, 2, 1])                  # (b, h, sq)
+            sq_row = (og * og).sum(-1).transpose([0, 2, 1])                  # (b, h, sq)
+            del og
+            p = p_sink_ref.astype("float32")                                 # (b, h, sq)
+            sigma = U[dtype] / math.sqrt(3.0) * (p * p * sq_row).sum(axis=[0, 2]).sqrt()  # (h,)
+            abs_sum = (p * abs_row).sum(axis=[0, 2])                         # (h,)
+            ref = sink_ref.grad.astype("float32")                            # (h,)
 
-        # Compare in fp32: sink may be fp16/bf16/fp32, err_scale comes from bf16 attn_ref
-        dsink_diff = (
-            sink.grad.astype(paddle.float32) - sink_ref.grad.astype(paddle.float32)
-        ).abs()
-        dsink_tol = 1e-2 + rtol * 2**-8 * err_scale
+            dsink_diff = (sink.grad.astype("float32") - ref).abs()
+            dsink_tol = 8 * sigma + 16 * EPS32 * abs_sum + 2 * U[sink_dtype] * ref.abs()
+            dsink_ratio = dsink_diff / paddle.clip(sigma, min=1e-30)
+            # Report the head furthest past its own tolerance, not independent maxima.
+            worst = int((dsink_diff - dsink_tol).argmax().item())
+        print(f"dsink diff/sigma max: {dsink_ratio.max().item():.2f} (head {int(dsink_ratio.argmax().item())})")
         assert bool((dsink_diff <= dsink_tol).all().item()), (
-            f"dsink mismatch (sink dtype={sink_dtype}): "
-            f"max_diff={dsink_diff.max().item():.6f}, "
-            f"max_tol={dsink_tol.max().item():.6f}, "
-            f"err_scale_max={err_scale.max().item():.4f}"
+            f"dsink mismatch (sink dtype={sink_dtype}), worst head {worst}: "
+            f"diff={dsink_diff[worst].item():.6f} > tol={dsink_tol[worst].item():.6f} "
+            f"(sigma={sigma[worst].item():.6f}, diff/sigma={dsink_ratio[worst].item():.2f}); "
+            f"{int((dsink_diff > dsink_tol).sum().item())}/{dsink_diff.shape[0]} heads over tolerance"
         )
 
     paddle.device.cuda.empty_cache()

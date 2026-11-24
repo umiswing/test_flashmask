@@ -110,6 +110,7 @@ def attention_ref(
     intermediate_dtype=None,
     softmax_scale=None,
     learnable_sink=None,
+    return_p_sink=False,
 ):
     """
     Arguments:
@@ -269,6 +270,10 @@ def attention_ref(
     output = paddle.transpose(output, [0, 2, 1, 3])
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+    if return_p_sink:
+        assert learnable_sink is not None, "return_p_sink requires learnable_sink"
+        p_sink = attention_full[..., -1].cast(paddle.float32)   # fp32, unrounded sink column
+        return output.cast(dtype=dtype_og), attention.cast(dtype=dtype_og), p_sink
     return output.cast(dtype=dtype_og), attention.cast(dtype=dtype_og)
 
 
